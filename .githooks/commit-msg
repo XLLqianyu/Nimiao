@@ -1,0 +1,61 @@
+#!/bin/sh
+# Commit message gate for Nimiao.
+#
+# Enforces Conventional Commits on the subject line. Enable it once with:
+#
+#     git config core.hooksPath .githooks
+#
+# Merges and interactive-rebase fixups are let through untouched.
+
+set -e
+
+message_file="$1"
+subject=$(head -n 1 "$message_file")
+
+# Merge commits carry a generated subject.
+if [ -f "$(git rev-parse --git-dir)/MERGE_HEAD" ]; then
+    exit 0
+fi
+case "$subject" in
+    "Merge "*|"Revert "*|"fixup! "*|"squash! "*|"amend! "*|"reword! "*)
+        exit 0
+        ;;
+esac
+
+types='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert'
+pattern="^($types)(\([a-z0-9./-]+\))?!?: [a-z0-9]"
+
+if printf '%s' "$subject" | grep -Eq "$pattern"; then
+    if [ "${#subject}" -gt 72 ]; then
+        printf '\ncommit-msg: subject is %s characters, the limit is 72\n' "${#subject}" >&2
+        printf '  %s\n\n' "$subject" >&2
+        exit 1
+    fi
+    case "$subject" in
+        *.)
+            printf '\ncommit-msg: the subject must not end with a period\n  %s\n\n' "$subject" >&2
+            exit 1
+            ;;
+    esac
+    exit 0
+fi
+
+cat >&2 <<'EOF'
+
+commit-msg: the subject line does not follow Conventional Commits.
+
+  <type>(<scope>)!: <subject>
+
+  type    feat fix docs style refactor perf test build ci chore revert
+  scope   optional: protocol sandbox execpolicy tools model engine cli repo ci
+  subject lowercase, no trailing period, max 72 characters
+
+Examples:
+  feat(tools): add timeout to the bash tool
+  fix(sandbox): reject device paths on windows
+  docs: describe the release flow
+  refactor(engine)!: rename run_turn to step
+
+See CONTRIBUTING.md for the full policy.
+EOF
+exit 1

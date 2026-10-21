@@ -1,0 +1,63 @@
+name: Bug report
+description: Something behaves differently than documented.
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please search existing issues first.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The observed behaviour, including the exact error message.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Set OPENAI_MODEL_NAME to ...
+        2. Run `nimiao`
+        3. Ask for ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Nimiao version
+      description: The release tag, or the output of `git rev-parse --short HEAD`.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Console output or logs. Remove secrets and API keys.
+      render: shell
+    validations:
+      required: false

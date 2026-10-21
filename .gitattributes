@@ -1,0 +1,7 @@
+# Normalize line endings in the repository; check out with the platform default.
+* text=auto
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.lock  text eol=lf linguist-generated
+.githooks/* text eol=lf

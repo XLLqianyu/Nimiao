@@ -1,0 +1,20 @@
+[package]
+name = "nimiao-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "nimiao"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+protocol = { path = "../protocol" }
+model = { path = "../model" }
+engine = { path = "../engine" }
+sandbox = { path = "../sandbox" }
+tools = { path = "../tools" }
