@@ -9,6 +9,11 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 tokio.workspace = true
+serde_json.workspace = true
 protocol = { path = "../protocol" }
 model = { path = "../model" }
 tools = { path = "../tools" }
+
+[dev-dependencies]
+async-trait.workspace = true
+sandbox = { path = "../sandbox" }
