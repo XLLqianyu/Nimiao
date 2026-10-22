@@ -15,17 +15,33 @@ const MAX_EVENT_BYTES: usize = 1024 * 1024;
 /// so this cap is deliberately looser than the event cap.
 const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Byte-order mark some servers put in front of the body.
+const BOM: &[u8] = b"\xEF\xBB\xBF";
+
 /// Turns a byte stream into event payloads.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SseDecoder {
     buffer: Vec<u8>,
     data: String,
     has_data: bool,
+    /// No byte has been inspected yet, so a BOM may still arrive.
+    at_start: bool,
+}
+
+impl Default for SseDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SseDecoder {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            buffer: Vec::new(),
+            data: String::new(),
+            has_data: false,
+            at_start: true,
+        }
     }
 
     /// Feeds raw bytes and returns every payload completed by them.
@@ -36,6 +52,9 @@ impl SseDecoder {
     /// character boundary.
     pub fn feed(&mut self, bytes: &[u8]) -> anyhow::Result<Vec<String>> {
         self.buffer.extend_from_slice(bytes);
+        if self.at_start {
+            self.strip_bom();
+        }
 
         let mut events = Vec::new();
         let mut start = 0;
@@ -59,6 +78,22 @@ impl SseDecoder {
             bail!("the response sent a line larger than {MAX_LINE_BYTES} bytes");
         }
         Ok(events)
+    }
+
+    /// Drops a leading byte-order mark once enough bytes have arrived.
+    ///
+    /// The mark may be split across reads, so this runs until the decoder has
+    /// seen a byte or can rule the mark out.
+    fn strip_bom(&mut self) {
+        if self.buffer.starts_with(BOM) {
+            self.buffer.drain(..BOM.len());
+            self.at_start = false;
+        } else if self.buffer.len() >= BOM.len()
+            || !BOM.starts_with(&self.buffer[..self.buffer.len().min(BOM.len())])
+        {
+            // Enough bytes to tell, and they are not a mark.
+            self.at_start = false;
+        }
     }
 
     /// Flushes a trailing event that was not terminated by a blank line.
@@ -114,7 +149,7 @@ impl SseDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::SseDecoder;
+    use super::{SseDecoder, MAX_EVENT_BYTES};
 
     fn feed_all(decoder: &mut SseDecoder, chunks: &[&[u8]]) -> Vec<String> {
         let mut events = Vec::new();
@@ -194,5 +229,58 @@ mod tests {
         assert!(decoder.feed(b"data: tail").unwrap().is_empty());
         assert_eq!(decoder.finish().as_deref(), Some("tail"));
         assert_eq!(decoder.finish(), None);
+    }
+
+    #[test]
+    fn strips_a_leading_byte_order_mark() {
+        let mut decoder = SseDecoder::new();
+        let events = feed_all(&mut decoder, &[b"\xEF\xBB\xBFdata: one\n\n"]);
+        assert_eq!(events, ["one"]);
+    }
+
+    #[test]
+    fn strips_a_byte_order_mark_split_across_feeds() {
+        let mut decoder = SseDecoder::new();
+        let events = feed_all(&mut decoder, &[b"\xEF", b"\xBB", b"\xBFdata: one\n\n"]);
+        assert_eq!(events, ["one"]);
+    }
+
+    #[test]
+    fn keeps_a_payload_that_starts_with_the_mark_bytes() {
+        // Not at the start of the body, so these bytes are data.
+        let mut decoder = SseDecoder::new();
+        let events = feed_all(&mut decoder, &[b"data: a\n\ndata: \xEF\xBB\xBFb\n\n"]);
+        assert_eq!(events, ["a", "\u{feff}b"]);
+    }
+
+    #[test]
+    fn handles_a_value_without_a_leading_space() {
+        let mut decoder = SseDecoder::new();
+        let events = feed_all(&mut decoder, &[b"data:one\n\n"]);
+        assert_eq!(events, ["one"]);
+    }
+
+    #[test]
+    fn handles_mixed_line_endings_in_one_feed() {
+        let mut decoder = SseDecoder::new();
+        let events = feed_all(&mut decoder, &[b"data: one\r\n\r\ndata: two\n\n"]);
+        assert_eq!(events, ["one", "two"]);
+    }
+
+    #[test]
+    fn drops_a_blank_event_after_a_comment() {
+        let mut decoder = SseDecoder::new();
+        let events = feed_all(&mut decoder, &[b"data: one\n\n: note\n\n"]);
+        assert_eq!(events, ["one"]);
+    }
+
+    #[test]
+    fn rejects_an_oversized_event() {
+        let mut decoder = SseDecoder::new();
+        let payload = vec![b'x'; MAX_EVENT_BYTES + 1];
+        let error = decoder
+            .feed(&[b"data: ".as_slice(), &payload, b"\n\n"].concat())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("larger than"), "{error:#}");
     }
 }

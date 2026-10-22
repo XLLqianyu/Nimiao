@@ -1,5 +1,6 @@
 use crate::sse::SseDecoder;
 use crate::{Model, ModelEvent, ModelResponse, ToolDefinition};
+use anyhow::Context;
 use async_trait::async_trait;
 use protocol::{Item, ToolCall};
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
@@ -261,7 +262,7 @@ async fn fall_back(
 
 /// Drains the rest of a response body, keeping `bytes` as the start of it.
 async fn read_body(res: &mut reqwest::Response, mut bytes: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-    while let Some(chunk) = res.chunk().await? {
+    while let Some(chunk) = res.chunk().await.context("reading the response body")? {
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
@@ -281,7 +282,11 @@ async fn consume_stream(
     let mut decoder = SseDecoder::new();
     let mut state = StreamState::new();
 
-    while let Some(chunk) = res.chunk().await? {
+    while let Some(chunk) = res
+        .chunk()
+        .await
+        .context("the response stream ended unexpectedly")?
+    {
         if state.sniffing {
             state.raw.extend_from_slice(&chunk);
             if state.raw.len() > MAX_SNIFF_BYTES {
@@ -608,5 +613,103 @@ mod tests {
         assert!(state.apply("[DONE]", &mut |_| {}).unwrap().is_none());
         assert!(state.apply("", &mut |_| {}).unwrap().is_none());
         assert_eq!(state.finish().content.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn assembles_text_split_inside_a_character() {
+        let mut state = StreamState::new();
+        let mut events = vec![];
+        let mut decoder = crate::sse::SseDecoder::new();
+
+        let frames = "data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n\n\
+                      data: {\"choices\":[{\"delta\":{\"content\":\"好\"}}]}\n\n";
+        // Split inside the second character's UTF-8 bytes.
+        let split = frames.find('你').unwrap() + 1;
+        for part in [&frames.as_bytes()[..split], &frames.as_bytes()[split..]] {
+            for frame in decoder.feed(part).unwrap() {
+                apply(&mut state, &frame, &mut events);
+            }
+        }
+
+        assert_eq!(
+            events,
+            [
+                ModelEvent::Text("你".to_string()),
+                ModelEvent::Text("好".to_string())
+            ]
+        );
+        assert_eq!(state.finish().content.as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn treats_a_missing_tool_index_as_the_first_call() {
+        let mut accumulator = ToolCallAccumulator::default();
+        accumulator.push(&json!({
+            "id": "call_1",
+            "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}
+        }));
+
+        let calls = accumulator.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].arguments, json!({"command": "ls"}));
+    }
+
+    #[test]
+    fn keeps_the_first_id_and_name_of_a_call() {
+        let mut accumulator = ToolCallAccumulator::default();
+        accumulator.push(&json!({"index": 0, "id": "first", "function": {"name": "bash"}}));
+        // Later fragments usually omit both; a repeated one must not overwrite.
+        accumulator.push(&json!({"index": 0, "id": "second", "function": {"name": "other"}}));
+
+        let calls = accumulator.finish();
+        assert_eq!(calls[0].id, "first");
+        assert_eq!(calls[0].name, "bash");
+    }
+
+    #[test]
+    fn treats_a_null_content_as_no_reply() {
+        let mut state = StreamState::new();
+        apply(
+            &mut state,
+            r#"{"choices":[{"delta":{"content":null}}]}"#,
+            &mut vec![],
+        );
+
+        let response = state.finish();
+        assert_eq!(response.content, None);
+        assert!(response.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn joins_text_that_arrives_with_tool_calls() {
+        let mut state = StreamState::new();
+        let mut events = vec![];
+
+        apply(
+            &mut state,
+            r#"{"choices":[{"delta":{"content":"calling ","tool_calls":[{"index":0,"id":"c","function":{"name":"bash","arguments":"{}"}}]}}]}"#,
+            &mut events,
+        );
+
+        let response = state.finish();
+        assert_eq!(response.content.as_deref(), Some("calling "));
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(events, [ModelEvent::Text("calling ".to_string())]);
+    }
+
+    #[test]
+    fn reads_a_whole_completion_with_tool_calls() {
+        let mut state = StreamState::new();
+        let mut events = vec![];
+
+        state
+            .apply(
+                r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}"#,
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+
+        assert_eq!(events, [ModelEvent::Fallback]);
     }
 }
