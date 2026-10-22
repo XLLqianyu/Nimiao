@@ -19,8 +19,9 @@ export OPENAI_MODEL_NAME=gpt-4o                    # optional
 cargo run -p nimiao-cli
 ```
 
-The REPL prints a green `>` prompt and answers with a blue `Agent:` prefix.
-Type `exit` or `quit`, or send EOF, to leave.
+The REPL prints a green `>` prompt and answers under a blue `Agent:` prefix.
+Replies appear as they are generated rather than all at once. Type `exit` or
+`quit`, or send EOF, to leave.
 
 | Variable | Required | Default |
 | --- | --- | --- |
@@ -42,18 +43,45 @@ tool rounds so a model that never stops calling tools cannot run forever.
 user input
     │
     ▼
-┌─────────────────────────────────────┐
-│ complete(history, tool definitions) │◄────┐
-└─────────────────────────────────────┘     │
-    │                                       │
-    ├── no tool calls ──► reply, turn ends  │
-    │                                       │
-    └── tool calls ──► execute ──► results ─┘
+┌──────────────────────────────────────────────┐
+│ complete_stream(history, tool definitions)   │◄────┐
+└──────────────────────────────────────────────┘     │
+    │  text deltas render as they arrive             │
+    ├── no tool calls ──► reply, turn ends            │
+    │                                                 │
+    └── tool calls ──► execute ──► results ───────────┘
 ```
 
 Conversation state lives in one `Vec<Item>`. Every user message, assistant
 reply, tool call, and tool result is appended to it, so each turn sees
 everything before it.
+
+## Streaming
+
+Each step is requested with `stream: true` and read as server-sent events. Prose
+appears token by token under the `Agent:` label. A tool call is not rendered as
+it streams; once the model finishes deciding, it produces one status line before
+the tool runs:
+
+```
+> bash(cargo test)
+```
+
+The preview shows the `command` argument, or the `path` for file tools, on a
+single line, cut to 60 characters.
+
+Some OpenAI-compatible proxies do not support streaming. Nimiao handles that
+without configuration:
+
+- A `400` or `422` rejection of the request is retried once without `stream`.
+- A `200` whose content type is not `text/event-stream` is read whole.
+- A response that claims to be a stream but carries plain JSON is read whole.
+- A single SSE frame that holds a finished `message` instead of a `delta` is
+  used as the reply.
+
+In all four cases the reply is still correct and a gray `note:` line on stderr
+says the endpoint did not stream. Other failures, such as an invalid key or a
+rate limit, are reported as errors and are not retried.
 
 ## Workspace layout
 
@@ -63,7 +91,7 @@ everything before it.
 | `sandbox` | Workspace-scoped path validation |
 | `execpolicy` | Static screening of shell commands |
 | `tools` | The four built-in tools |
-| `model` | `Model` trait and an OpenAI-compatible implementation |
+| `model` | `Model` trait, SSE decoding, and an OpenAI-compatible implementation |
 | `engine` | The `Agent` loop |
 | `nimiao-cli` | The REPL binary, `nimiao` |
 
