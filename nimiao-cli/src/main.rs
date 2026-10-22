@@ -121,8 +121,9 @@ async fn main() {
 }
 
 /// Renders streamed events, remembering where the cursor is.
-struct Renderer {
-    out: io::Stdout,
+struct Renderer<O: Write, E: Write> {
+    out: O,
+    err: E,
     /// The cursor is at the start of a line.
     at_line_start: bool,
     /// The next text needs an `Agent:` label.
@@ -133,10 +134,17 @@ struct Renderer {
     error: Option<io::Error>,
 }
 
-impl Renderer {
+impl Renderer<io::Stdout, io::Stderr> {
     fn new() -> Self {
+        Self::with_writers(io::stdout(), io::stderr())
+    }
+}
+
+impl<O: Write, E: Write> Renderer<O, E> {
+    fn with_writers(out: O, err: E) -> Self {
         Self {
-            out: io::stdout(),
+            out,
+            err,
             at_line_start: true,
             label_pending: true,
             wrote_text: false,
@@ -172,7 +180,7 @@ impl Renderer {
             }
             AgentEvent::Notice(text) => {
                 self.end_line();
-                eprintln!("{NOTICE_PREFIX}\x1b[90m{text}\x1b[0m");
+                self.note(&text);
                 self.label_pending = true;
             }
         }
@@ -214,6 +222,20 @@ impl Renderer {
             return;
         }
         if let Err(err) = self.out.flush() {
+            self.error = Some(err);
+        }
+    }
+
+    fn note(&mut self, text: &str) {
+        if self.error.is_some() {
+            return;
+        }
+        let line = format!("{NOTICE_PREFIX}\x1b[90m{text}\x1b[0m\n");
+        if let Err(err) = self
+            .err
+            .write_all(line.as_bytes())
+            .and_then(|()| self.err.flush())
+        {
             self.error = Some(err);
         }
     }
@@ -307,6 +329,151 @@ fn enable_ansi() {}
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    /// Renders into memory so the output can be asserted on.
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Buffer {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn renderer() -> (Renderer<Buffer, Buffer>, Buffer, Buffer) {
+        let out = Buffer::default();
+        let err = Buffer::default();
+        (Renderer::with_writers(out.clone(), err.clone()), out, err)
+    }
+
+    #[test]
+    fn labels_the_first_text_and_not_each_delta() {
+        let (mut renderer, out, _) = renderer();
+        renderer.begin_turn();
+        renderer.on_event(AgentEvent::Text("Hel".to_string()));
+        renderer.on_event(AgentEvent::Text("lo".to_string()));
+        renderer.finish_turn();
+
+        let text = out.text();
+        assert_eq!(text.matches(AGENT_PREFIX).count(), 1, "{text:?}");
+        assert!(text.contains("Hello"), "{text:?}");
+        assert!(text.ends_with('\n'), "{text:?}");
+    }
+
+    #[test]
+    fn keeps_a_multi_line_reply_under_one_label() {
+        let (mut renderer, out, _) = renderer();
+        renderer.begin_turn();
+        renderer.on_event(AgentEvent::Text("first\nsecond\n".to_string()));
+        renderer.on_event(AgentEvent::Text("third".to_string()));
+        renderer.finish_turn();
+
+        let text = out.text();
+        assert_eq!(text.matches(AGENT_PREFIX).count(), 1, "{text:?}");
+        assert!(!text.contains("second\n\n"), "no blank line: {text:?}");
+        assert!(text.ends_with("third\n"), "{text:?}");
+    }
+
+    #[test]
+    fn closes_an_open_line_before_a_tool_status() {
+        let (mut renderer, out, _) = renderer();
+        renderer.begin_turn();
+        renderer.on_event(AgentEvent::Text("thinking".to_string()));
+        renderer.on_event(AgentEvent::ToolStarted {
+            name: "bash".to_string(),
+            arguments: json!({"command": "ls"}),
+        });
+        renderer.finish_turn();
+
+        let text = out.text();
+        assert!(text.contains("thinking\n"), "{text:?}");
+        assert!(text.contains("> bash(ls)"), "{text:?}");
+    }
+
+    #[test]
+    fn labels_text_again_after_a_tool_status() {
+        let (mut renderer, out, _) = renderer();
+        renderer.begin_turn();
+        renderer.on_event(AgentEvent::Text("before".to_string()));
+        renderer.on_event(AgentEvent::ToolStarted {
+            name: "bash".to_string(),
+            arguments: json!({"command": "ls"}),
+        });
+        renderer.on_event(AgentEvent::Text("after".to_string()));
+        renderer.finish_turn();
+
+        let text = out.text();
+        assert_eq!(text.matches(AGENT_PREFIX).count(), 2, "{text:?}");
+    }
+
+    #[test]
+    fn writes_notices_to_stderr_and_keeps_stdout_clean() {
+        let (mut renderer, out, err) = renderer();
+        renderer.begin_turn();
+        renderer.on_event(AgentEvent::Text("partial".to_string()));
+        renderer.on_event(AgentEvent::Notice("fell back".to_string()));
+        renderer.on_event(AgentEvent::Text("more".to_string()));
+        renderer.finish_turn();
+
+        let out = out.text();
+        assert!(!out.contains("fell back"), "{out:?}");
+        assert!(out.contains("partial\n"), "the line is closed: {out:?}");
+        assert!(err.text().contains("fell back"), "{:?}", err.text());
+    }
+
+    #[test]
+    fn fills_in_a_missing_reply() {
+        let (mut renderer, out, _) = renderer();
+        renderer.begin_turn();
+        renderer.finish_turn();
+
+        assert!(out.text().contains("(no reply)"), "{:?}", out.text());
+    }
+
+    #[test]
+    fn is_silent_when_a_write_failed() {
+        let out = Buffer::default();
+        let mut renderer = Renderer::with_writers(out.clone(), Buffer::default());
+        renderer.begin_turn();
+        renderer.write("x");
+        renderer.error = Some(io::Error::other("disk full"));
+
+        renderer.finish_turn();
+
+        assert!(!out.text().contains("(no reply)"), "{:?}", out.text());
+        assert!(renderer.take_error().is_some());
+        assert!(
+            renderer.take_error().is_none(),
+            "the error is reported once"
+        );
+    }
+
+    #[test]
+    fn does_not_double_space_a_turn_boundary() {
+        let (mut renderer, out, _) = renderer();
+        renderer.begin_turn();
+        renderer.on_event(AgentEvent::Text("one\n".to_string()));
+        renderer.finish_turn();
+        renderer.begin_turn();
+        renderer.on_event(AgentEvent::Text("two".to_string()));
+        renderer.finish_turn();
+
+        let text = out.text();
+        assert!(!text.contains("one\n\n"), "{text:?}");
+        assert!(text.ends_with("two\n"), "{text:?}");
+    }
 
     #[test]
     fn previews_the_command() {
@@ -341,5 +508,13 @@ mod tests {
     #[test]
     fn falls_back_to_the_whole_argument_object() {
         assert_eq!(tool_preview(&json!({"timeout": 30})), "{\"timeout\":30}");
+    }
+
+    #[test]
+    fn ignores_an_empty_command_in_favour_of_a_path() {
+        assert_eq!(
+            tool_preview(&json!({"command": "  ", "path": "a.txt"})),
+            "a.txt"
+        );
     }
 }

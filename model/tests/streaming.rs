@@ -105,6 +105,47 @@ async fn write_response(stream: &mut TcpStream, reply: Reply) {
     stream.shutdown().await.unwrap();
 }
 
+/// Writes a streamed body with `Transfer-Encoding: chunked`, one write per
+/// piece, so frames reach the client in separate reads.
+async fn write_chunked(stream: &mut TcpStream, pieces: &[&str], close: bool) {
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).await.unwrap();
+    for piece in pieces {
+        let chunk = format!("{:X}\r\n{piece}\r\n", piece.len());
+        stream.write_all(chunk.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+    stream.write_all(b"0\r\n\r\n").await.unwrap();
+    if close {
+        stream.shutdown().await.unwrap();
+    }
+}
+
+/// Spawns a server that hands every request to `handle`.
+async fn serve<F, Fut>(handle: F) -> String
+where
+    F: Fn(TcpStream) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let handle = Arc::new(handle);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move {
+                read_request(&mut stream).await;
+                handle(stream).await;
+            });
+        }
+    });
+    base_url
+}
+
 /// Runs a streaming completion and collects the events it reported.
 async fn stream_events(model: &OpenAIModel) -> (ModelResponse, Vec<ModelEvent>) {
     let mut events = Vec::new();
@@ -348,4 +389,248 @@ async fn reports_tool_definitions_and_history() {
         .unwrap();
 
     assert_eq!(response.content.as_deref(), Some("ok"));
+}
+
+#[tokio::test]
+async fn reads_a_chunked_stream_piece_by_piece() {
+    let base_url = serve(|mut stream| async move {
+        write_chunked(
+            &mut stream,
+            &[
+                "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}",
+                "\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n",
+                "data: [DONE]\n\n",
+            ],
+            true,
+        )
+        .await;
+    })
+    .await;
+
+    let model = OpenAIModel::new("test-key", &base_url, "test-model");
+    let (response, events) = stream_events(&model).await;
+
+    assert_eq!(response.content.as_deref(), Some("abc"));
+    assert_eq!(
+        events,
+        [
+            ModelEvent::Text("a".to_string()),
+            ModelEvent::Text("b".to_string()),
+            ModelEvent::Text("c".to_string())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn returns_as_soon_as_done_arrives() {
+    // The connection stays open after `[DONE]`, as a keep-alive proxy might
+    // leave it. The call must not wait for a close that never comes.
+    let base_url = serve(|mut stream| async move {
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                    Transfer-Encoding: chunked\r\n\r\n";
+        stream.write_all(head.as_bytes()).await.unwrap();
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"early\"}}]}\n\ndata: [DONE]\n\n";
+        let chunk = format!("{:X}\r\n{body}\r\n", body.len());
+        stream.write_all(chunk.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        // Hold the connection open well past the assertion below.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    })
+    .await;
+
+    let model = OpenAIModel::new("test-key", &base_url, "test-model");
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        stream_events(&model).await
+    })
+    .await
+    .expect("the call waited for the connection to close after [DONE]");
+
+    assert_eq!(completed.0.content.as_deref(), Some("early"));
+}
+
+#[tokio::test]
+async fn streams_parallel_tool_calls_and_keeps_index_order() {
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\"}}]}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"\\\"b.txt\\\"}\"}}]}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"ls\\\"}\"}}]}}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    let calls = response.tool_calls;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].id, "call_a");
+    assert_eq!(calls[0].name, "bash");
+    assert_eq!(calls[0].arguments, serde_json::json!({"command": "ls"}));
+    assert_eq!(calls[1].id, "call_b");
+    assert_eq!(calls[1].name, "read_file");
+    assert_eq!(calls[1].arguments, serde_json::json!({"path": "b.txt"}));
+}
+
+#[tokio::test]
+async fn reports_the_status_when_the_retry_also_fails() {
+    let (model, served) = model_replying(vec![
+        Reply {
+            status: "400 Bad Request",
+            headers: "Content-Type: application/json\r\n",
+            body: "{\"error\":{\"message\":\"bad stream\"}}",
+        },
+        Reply {
+            status: "500 Internal Server Error",
+            headers: "Content-Type: application/json\r\n",
+            body: "{\"error\":{\"message\":\"still broken\"}}",
+        },
+    ])
+    .await;
+
+    let error = model
+        .complete_stream(&[], &[], &mut |_| {})
+        .await
+        .unwrap_err();
+    let message = format!("{error:#}");
+
+    assert_eq!(served.load(Ordering::SeqCst), 2, "the retry must happen");
+    assert!(message.contains("500"), "{message}");
+    assert!(message.contains("still broken"), "{message}");
+}
+
+#[tokio::test]
+async fn retries_after_a_422_rejection() {
+    let (model, served) = model_replying(vec![
+        Reply {
+            status: "422 Unprocessable Entity",
+            headers: "Content-Type: application/json\r\n",
+            body: "{\"error\":{\"message\":\"stream not supported\"}}",
+        },
+        Reply::json("{\"choices\":[{\"message\":{\"content\":\"fine\"}}]}"),
+    ])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+    assert_eq!(response.content.as_deref(), Some("fine"));
+}
+
+#[tokio::test]
+async fn does_not_retry_a_server_error() {
+    let (model, served) = model_replying(vec![Reply {
+        status: "503 Service Unavailable",
+        headers: "Content-Type: text/plain\r\n",
+        body: "try later",
+    }])
+    .await;
+
+    let error = model
+        .complete_stream(&[], &[], &mut |_| {})
+        .await
+        .unwrap_err();
+
+    assert_eq!(served.load(Ordering::SeqCst), 1);
+    assert!(format!("{error:#}").contains("503"), "{error:#}");
+}
+
+#[tokio::test]
+async fn treats_a_content_type_parameter_as_a_stream() {
+    let (model, _) = model_replying(vec![Reply {
+        status: "200 OK",
+        headers: "Content-Type: text/event-stream; charset=utf-8\r\n",
+        body: "data: {\"choices\":[{\"delta\":{\"content\":\"utf8\"}}]}\n\ndata: [DONE]\n\n",
+    }])
+    .await;
+
+    let (response, events) = stream_events(&model).await;
+
+    assert_eq!(response.content.as_deref(), Some("utf8"));
+    assert_eq!(events, [ModelEvent::Text("utf8".to_string())]);
+}
+
+#[tokio::test]
+async fn treats_a_mixed_case_content_type_as_a_stream() {
+    let (model, _) = model_replying(vec![Reply {
+        status: "200 OK",
+        headers: "Content-Type: Text/Event-Stream\r\n",
+        body: "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+    }])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(response.content.as_deref(), Some("ok"));
+}
+
+#[tokio::test]
+async fn returns_an_empty_completion_for_an_empty_stream() {
+    let (model, _) = model_replying(vec![Reply::sse("data: [DONE]\n\n")]).await;
+
+    let (response, events) = stream_events(&model).await;
+
+    assert_eq!(response.content, None);
+    assert!(response.tool_calls.is_empty());
+    assert!(events.is_empty());
+}
+
+#[tokio::test]
+async fn reports_a_body_that_is_neither_stream_nor_json() {
+    let (model, _) = model_replying(vec![Reply::json("<html>proxy error</html>")]).await;
+
+    let error = model
+        .complete_stream(&[], &[], &mut |_| {})
+        .await
+        .unwrap_err();
+    let message = format!("{error:#}");
+
+    assert!(message.contains("neither"), "{message}");
+    assert!(message.contains("proxy error"), "{message}");
+}
+
+#[tokio::test]
+async fn skips_frames_that_are_not_json_and_keeps_streaming() {
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: ping\n\n\
+         data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, events) = stream_events(&model).await;
+
+    assert_eq!(response.content.as_deref(), Some("ok"));
+    assert_eq!(events, [ModelEvent::Text("ok".to_string())]);
+}
+
+#[tokio::test]
+async fn ignores_a_delta_without_choices() {
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[],\"usage\":{\"total_tokens\":9}}\n\n\
+         data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, events) = stream_events(&model).await;
+
+    assert_eq!(response.content.as_deref(), Some("x"));
+    assert_eq!(events, [ModelEvent::Text("x".to_string())]);
+}
+
+#[tokio::test]
+async fn keeps_a_finished_tool_call_whose_arguments_are_not_json() {
+    // A malformed fragment must not lose the call; it becomes `{}` as before.
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"not json\"}}]}}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].name, "bash");
+    assert_eq!(response.tool_calls[0].arguments, serde_json::json!({}));
 }
