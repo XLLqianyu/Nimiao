@@ -130,11 +130,14 @@ dependencies = [
 
 [[package]]
 name = "engine"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "model",
  "protocol",
+ "sandbox",
+ "serde_json",
  "tokio",
  "tools",
 ]
@@ -152,12 +155,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
 name = "execpolicy"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
 ]
@@ -602,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "model"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -610,6 +613,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -637,13 +641,14 @@ dependencies = [
 
 [[package]]
 name = "nimiao-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "engine",
  "model",
  "protocol",
  "sandbox",
+ "serde_json",
  "tokio",
  "tools",
 ]
@@ -758,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -852,7 +857,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -902,7 +907,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sandbox"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
 ]
@@ -1129,7 +1134,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1144,9 +1149,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.54.0"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0c168a474b95bfecfe908a65d4bdffc523144b649a74c09c286afb35d53e0bc"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -1206,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "async-trait",
