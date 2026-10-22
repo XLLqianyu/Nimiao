@@ -3,12 +3,14 @@
 //! Reads an OpenAI-compatible endpoint from the environment, wires one model
 //! to the built-in tool set, and serves a line-oriented REPL. The whole
 //! session lives in one history vector, so each turn sees everything before
-//! it.
+//! it. Replies are rendered as they stream in; tool calls appear as one status
+//! line each.
 
-use engine::Agent;
+use engine::{Agent, AgentEvent};
 use model::openai::OpenAIModel;
 use protocol::Item;
 use sandbox::Sandbox;
+use serde_json::Value;
 use std::io::{self, Write};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tools::{default_registry, ToolContext};
@@ -21,6 +23,15 @@ const AGENT_PREFIX: &str = "\x1b[94mAgent:\x1b[0m ";
 
 /// Bright red label for non-fatal errors.
 const ERROR_PREFIX: &str = "\x1b[91merror:\x1b[0m ";
+
+/// Gray start for tool status lines.
+const TOOL_PREFIX: &str = "\x1b[90m";
+
+/// Gray label for notices, which go to stderr.
+const NOTICE_PREFIX: &str = "\x1b[90mnote:\x1b[0m ";
+
+/// Longest tool-call preview, in characters.
+const PREVIEW_LIMIT: usize = 60;
 
 #[tokio::main]
 async fn main() {
@@ -56,6 +67,7 @@ async fn main() {
     println!("\x1b[90mType a request. `exit` or `quit` leaves.\x1b[0m");
 
     let mut history: Vec<Item> = Vec::new();
+    let mut renderer = Renderer::new();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
 
     loop {
@@ -83,18 +95,128 @@ async fn main() {
             break;
         }
 
-        if let Err(err) = agent.run_turn(&mut history, request).await {
-            eprintln!("{ERROR_PREFIX}{err:#}");
-            continue;
-        }
+        renderer.begin_turn();
+        let result = {
+            let mut sink = |event| renderer.on_event(event);
+            agent
+                .run_turn_stream(&mut history, request, &mut sink)
+                .await
+        };
 
-        match latest_assistant_message(&history) {
-            Some(reply) => println!("{AGENT_PREFIX}{reply}"),
-            None => println!("{AGENT_PREFIX}\x1b[90m(no reply)\x1b[0m"),
+        if let Err(err) = result {
+            // A partial reply leaves the cursor mid-line; start the error on a
+            // line of its own.
+            renderer.end_line();
+            eprintln!("{ERROR_PREFIX}{err:#}");
+        } else {
+            renderer.finish_turn();
+        }
+        if let Some(err) = renderer.take_error() {
+            eprintln!("{ERROR_PREFIX}cannot write output: {err}");
+            break;
         }
     }
 
     println!("\x1b[90mbye\x1b[0m");
+}
+
+/// Renders streamed events, remembering where the cursor is.
+struct Renderer {
+    out: io::Stdout,
+    /// The cursor is at the start of a line.
+    at_line_start: bool,
+    /// The next text needs an `Agent:` label.
+    label_pending: bool,
+    /// The turn produced at least one text delta.
+    wrote_text: bool,
+    /// First failed write, kept so the REPL can stop cleanly.
+    error: Option<io::Error>,
+}
+
+impl Renderer {
+    fn new() -> Self {
+        Self {
+            out: io::stdout(),
+            at_line_start: true,
+            label_pending: true,
+            wrote_text: false,
+            error: None,
+        }
+    }
+
+    /// Prepares for a new turn.
+    fn begin_turn(&mut self) {
+        self.end_line();
+        self.label_pending = true;
+        self.wrote_text = false;
+    }
+
+    fn on_event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::Text(delta) => {
+                if self.label_pending {
+                    self.write(AGENT_PREFIX);
+                    self.label_pending = false;
+                }
+                self.write(&delta);
+                self.at_line_start = delta.ends_with('\n');
+                self.wrote_text = true;
+                self.flush();
+            }
+            AgentEvent::ToolStarted { name, arguments } => {
+                self.end_line();
+                let preview = tool_preview(&arguments);
+                self.write(&format!("{TOOL_PREFIX}> {name}({preview})\x1b[0m\n"));
+                self.flush();
+                self.label_pending = true;
+            }
+            AgentEvent::Notice(text) => {
+                self.end_line();
+                eprintln!("{NOTICE_PREFIX}\x1b[90m{text}\x1b[0m");
+                self.label_pending = true;
+            }
+        }
+    }
+
+    /// Ends the open line, if any.
+    fn end_line(&mut self) {
+        if !self.at_line_start {
+            self.write("\n");
+            self.flush();
+            self.at_line_start = true;
+        }
+    }
+
+    /// Ends the turn: closes the line and fills in a missing reply.
+    fn finish_turn(&mut self) {
+        self.end_line();
+        if !self.wrote_text && self.error.is_none() {
+            self.write(&format!("{AGENT_PREFIX}\x1b[90m(no reply)\x1b[0m\n"));
+            self.flush();
+        }
+    }
+
+    fn take_error(&mut self) -> Option<io::Error> {
+        self.error.take()
+    }
+
+    fn write(&mut self, text: &str) {
+        if self.error.is_some() {
+            return;
+        }
+        if let Err(err) = self.out.write_all(text.as_bytes()) {
+            self.error = Some(err);
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.error.is_some() {
+            return;
+        }
+        if let Err(err) = self.out.flush() {
+            self.error = Some(err);
+        }
+    }
 }
 
 /// Reads an environment variable, treating blank values as absent.
@@ -104,12 +226,47 @@ fn read_env(name: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-/// The model's most recent prose reply, newest first.
-fn latest_assistant_message(history: &[Item]) -> Option<&str> {
-    history.iter().rev().find_map(|item| match item {
-        Item::AssistantMessage(text) => Some(text.as_str()),
-        _ => None,
-    })
+/// One short, single-line summary of a tool call's arguments.
+///
+/// Shell commands and paths identify a call best. Other tools fall back to the
+/// first string in the argument object. `serde_json` keeps object keys sorted,
+/// so that fallback would show `write_file`'s whole `content` before its
+/// `path`; the explicit order above prevents it.
+fn tool_preview(arguments: &Value) -> String {
+    let Some(object) = arguments.as_object() else {
+        return truncate(&arguments.to_string());
+    };
+
+    let preferred = ["command", "path"]
+        .into_iter()
+        .filter_map(|key| object.get(key).and_then(Value::as_str))
+        .chain(object.values().filter_map(Value::as_str))
+        .find(|value| !value.trim().is_empty());
+
+    match preferred {
+        Some(value) => truncate(&collapse(value)),
+        None => truncate(&arguments.to_string()),
+    }
+}
+
+/// Replaces control characters and whitespace runs with single spaces.
+fn collapse(text: &str) -> String {
+    text.chars()
+        .map(|letter| if letter.is_control() { ' ' } else { letter })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Caps `text` at [`PREVIEW_LIMIT`] characters, marking the cut.
+fn truncate(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut head: String = chars.by_ref().take(PREVIEW_LIMIT).collect();
+    if chars.next().is_some() {
+        head.push('…');
+    }
+    head
 }
 
 /// Turns on ANSI escape handling for the current console.
@@ -145,3 +302,44 @@ fn enable_ansi() {
 
 #[cfg(not(windows))]
 fn enable_ansi() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn previews_the_command() {
+        assert_eq!(
+            tool_preview(&json!({"command": "cargo test", "timeout": 60})),
+            "cargo test"
+        );
+    }
+
+    #[test]
+    fn prefers_the_path_over_other_content() {
+        let preview = tool_preview(&json!({"path": "src/main.rs", "content": "fn main() {}"}));
+        assert_eq!(preview, "src/main.rs");
+    }
+
+    #[test]
+    fn collapses_whitespace_and_control_characters() {
+        assert_eq!(
+            tool_preview(&json!({"command": "echo\n  hello\tworld"})),
+            "echo hello world"
+        );
+        assert_eq!(tool_preview(&json!({"command": "a\x1b[31mb"})), "a [31mb");
+    }
+
+    #[test]
+    fn truncates_long_values() {
+        let preview = tool_preview(&json!({"command": "x".repeat(100)}));
+        assert_eq!(preview.chars().count(), PREVIEW_LIMIT + 1);
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn falls_back_to_the_whole_argument_object() {
+        assert_eq!(tool_preview(&json!({"timeout": 30})), "{\"timeout\":30}");
+    }
+}
