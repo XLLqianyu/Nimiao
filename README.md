@@ -159,6 +159,16 @@ Branches, commit format, and the release process are described in
 [CONTRIBUTING.md](CONTRIBUTING.md). In short: Git Flow, Conventional Commits,
 pull requests target `develop`.
 
+## Releases
+
+**0.0.2.** Replies stream from an OpenAI-compatible endpoint as server-sent
+events, rendered as they arrive. Each tool call prints one status line before it
+runs, and endpoints that cannot stream fall back to a one-shot reply with a note
+on stderr. See [Streaming](#streaming).
+
+**0.0.1.** The first release: the agent loop, the four built-in tools, the
+sandbox, command screening, and the REPL.
+
 ### Platform notes
 
 CI runs the test suite on Linux and Windows. The Windows jobs matter: `sandbox`,
