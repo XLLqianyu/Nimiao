@@ -5,13 +5,27 @@
 //! step, runs whatever tools it asks for, and repeats until the model answers
 //! without further tool calls.
 
-use model::{Model, ModelResponse};
+use model::{Model, ModelEvent, ModelResponse};
 use protocol::{Item, ToolCall};
 use tools::{ToolContext, ToolRegistry};
 
 /// Upper bound on tool-calling rounds in a single turn, so a model that never
 /// stops asking for tools cannot loop forever.
 const MAX_STEPS_PER_TURN: usize = 32;
+
+/// Reported while a turn runs, for rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentEvent {
+    /// A fragment of the reply text, in order.
+    Text(String),
+    /// A tool is about to run.
+    ToolStarted {
+        name: String,
+        arguments: serde_json::Value,
+    },
+    /// Something worth telling the user that is not part of the reply.
+    Notice(String),
+}
 
 /// A model bound to a tool set and an execution context.
 pub struct Agent<M: Model> {
@@ -37,24 +51,43 @@ impl<M: Model> Agent<M> {
         &self.ctx
     }
 
-    /// Runs one user turn to completion and records every step in `history`.
+    /// Runs one user turn to completion and records every step in `history`,
+    /// reporting progress to `on_event` as it happens.
     ///
     /// Returns after the model produced a reply with no tool calls. The final
     /// reply is the last [`Item::AssistantMessage`] appended to `history`.
-    pub async fn run_turn(
+    pub async fn run_turn_stream(
         &self,
         history: &mut Vec<Item>,
         input: impl Into<String>,
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> anyhow::Result<()> {
         history.push(Item::UserMessage(input.into()));
 
         let definitions = self.tools.definitions();
+        // A non-streaming endpoint fails to stream on every tool round; say so
+        // once per turn rather than once per round.
+        let mut notified = false;
 
         for _ in 0..MAX_STEPS_PER_TURN {
+            let mut sink = |event: ModelEvent| match event {
+                ModelEvent::Text(text) => on_event(AgentEvent::Text(text)),
+                ModelEvent::Fallback => {
+                    if !notified {
+                        notified = true;
+                        on_event(AgentEvent::Notice(
+                            "upstream did not stream; fell back to a one-shot reply".to_string(),
+                        ));
+                    }
+                }
+            };
             let ModelResponse {
                 content,
                 tool_calls,
-            } = self.model.complete(history, &definitions).await?;
+            } = self
+                .model
+                .complete_stream(history, &definitions, &mut sink)
+                .await?;
 
             let text = content.filter(|text| !text.trim().is_empty());
 
@@ -71,7 +104,7 @@ impl<M: Model> Agent<M> {
             }
 
             for call in tool_calls {
-                self.run_tool(history, call).await;
+                self.run_tool(history, call, on_event).await;
             }
         }
 
@@ -80,9 +113,27 @@ impl<M: Model> Agent<M> {
         )
     }
 
+    /// Runs one user turn without reporting progress.
+    pub async fn run_turn(
+        &self,
+        history: &mut Vec<Item>,
+        input: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        self.run_turn_stream(history, input, &mut |_| {}).await
+    }
+
     /// Executes one tool call and records the call together with its result.
-    async fn run_tool(&self, history: &mut Vec<Item>, call: ToolCall) {
+    async fn run_tool(
+        &self,
+        history: &mut Vec<Item>,
+        call: ToolCall,
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
+    ) {
         let arguments = call.arguments;
+        on_event(AgentEvent::ToolStarted {
+            name: call.name.clone(),
+            arguments: arguments.clone(),
+        });
         let (content, is_error) = match self.tools.get(&call.name) {
             Some(tool) => match tool.execute(arguments.clone(), &self.ctx).await {
                 Ok(output) => (output.content, output.is_error),

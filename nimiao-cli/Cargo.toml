@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 tokio.workspace = true
+serde_json.workspace = true
 protocol = { path = "../protocol" }
 model = { path = "../model" }
 engine = { path = "../engine" }
