@@ -133,8 +133,11 @@ name = "engine"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "model",
  "protocol",
+ "sandbox",
+ "serde_json",
  "tokio",
  "tools",
 ]
@@ -610,6 +613,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -644,6 +648,7 @@ dependencies = [
  "model",
  "protocol",
  "sandbox",
+ "serde_json",
  "tokio",
  "tools",
 ]
