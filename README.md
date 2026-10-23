@@ -197,6 +197,10 @@ Branches, commit format, and the release process are described in
 [CONTRIBUTING.md](CONTRIBUTING.md). In short: Git Flow, Conventional Commits,
 pull requests target `develop`.
 
+`References/` is ignored through `.gitignore` and holds third-party reference
+checkouts used while working on Nimiao. Nothing in it is tracked, built, or
+published.
+
 ## Releases
 
 **0.0.3.** The interactive client is now a full-screen TUI built with ratatui:

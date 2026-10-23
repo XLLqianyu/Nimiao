@@ -102,9 +102,10 @@ Do not weaken these in passing:
 
 ## Files that are not part of the repository
 
-- Third-party reference checkouts are kept out of the repository. They are not
-  tracked and not workspace members. Do not edit them, stage them, or add them
-  to the workspace.
+- `References/` holds third-party reference checkouts used while working on
+  Nimiao. It is listed in `.gitignore`, so it is neither tracked nor a
+  workspace member. Do not edit it, stage it, add it to the workspace, or copy
+  it into a commit. Read it by absolute path.
 - `target/` is build output.
 - `Cargo.lock` is committed and updated by Cargo, never by hand.
 
