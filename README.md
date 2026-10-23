@@ -19,9 +19,13 @@ export OPENAI_MODEL_NAME=gpt-4o                    # optional
 cargo run -p nimiao-cli
 ```
 
-The REPL prints a green `>` prompt and answers under a blue `Agent:` prefix.
-Replies appear as they are generated rather than all at once. Type `exit` or
-`quit`, or send EOF, to leave.
+When both input and output are terminals, Nimiao opens a full-screen TUI. Use
+`--plain` (or redirect either stream) for the line-oriented REPL. Replies appear
+as they are generated in both modes.
+
+```bash
+cargo run -p nimiao-cli -- --plain
+```
 
 | Variable | Required | Default |
 | --- | --- | --- |
@@ -31,6 +35,40 @@ Replies appear as they are generated rather than all at once. Type `exit` or
 
 Any endpoint that speaks the OpenAI chat-completions API works, including local
 servers. Point `OPENAI_BASE_URL` at it and set `OPENAI_MODEL_NAME` accordingly.
+
+## Interactive client
+
+The TUI keeps the transcript, composer, running status, and queued prompts on
+one screen. It renders assistant prose as a small Markdown subset: headings,
+lists, quotes, inline code, and fenced code. Tables, syntax highlighting, and
+diffs stay plain text.
+
+| Key | Action |
+| --- | --- |
+| `Enter` | Send, or queue while a turn is running |
+| `Tab` | Queue while running; send when idle |
+| `Shift+Enter` | Insert a newline |
+| `Esc` | Interrupt the current turn |
+| `PgUp` / `PgDn` | Scroll the live transcript |
+| `Ctrl+Home` / `Ctrl+End` | Jump to the start or latest output |
+| `Ctrl+T` | Open or close the detailed transcript |
+| `Ctrl+C` | Interrupt when running; quit when idle |
+| `Ctrl+D` | Quit when the composer is empty |
+
+Queued prompts start automatically, one at a time, after a successful turn. An
+error pauses the queue so it is not sent blindly; press `Tab` on an empty
+composer to send the next one. Interrupting keeps the partial reply visible with
+an `[interrupted]` marker, but that partial text is not added to model history.
+Any queued prompts and the current draft are merged back into the composer.
+
+The detail page scrolls with `↑`/`↓`, `j`/`k`, `PgUp`/`PgDn`, `Space`, `Ctrl+B`/
+`Ctrl+F`, and `Ctrl+U`/`Ctrl+D`; `Home`/`End` jump to either end. Close it with
+`q`, `Ctrl+C`, or `Ctrl+T`.
+
+Commands are `/help`, `/clear`, and `/quit`. `/clear` clears both the visible
+transcript and model history, and only runs while no turn is active. The plain
+REPL keeps its original line-oriented behaviour and exits with `exit`, `quit`,
+or EOF.
 
 ## How it works
 
@@ -59,9 +97,9 @@ everything before it.
 ## Streaming
 
 Each step is requested with `stream: true` and read as server-sent events. Prose
-appears token by token under the `Agent:` label. A tool call is not rendered as
-it streams; once the model finishes deciding, it produces one status line before
-the tool runs:
+appears token by token in the transcript (under the `Agent:` label in plain
+mode). A tool call is not rendered as it streams; once the model finishes
+deciding, it produces one status line before the tool runs:
 
 ```
 > bash(cargo test)
@@ -93,7 +131,7 @@ rate limit, are reported as errors and are not retried.
 | `tools` | The four built-in tools |
 | `model` | `Model` trait, SSE decoding, and an OpenAI-compatible implementation |
 | `engine` | The `Agent` loop |
-| `nimiao-cli` | The REPL binary, `nimiao` |
+| `nimiao-cli` | The TUI and plain-REPL binary, `nimiao` |
 
 Dependencies point one way. `protocol` has no internal dependencies.
 `sandbox` and `execpolicy` are standalone. `tools` builds on `protocol`,

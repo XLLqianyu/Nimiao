@@ -7,6 +7,7 @@
 
 use model::{Model, ModelEvent, ModelResponse};
 use protocol::{Item, ToolCall};
+use std::future::Future;
 use tools::{ToolContext, ToolRegistry};
 
 /// Upper bound on tool-calling rounds in a single turn, so a model that never
@@ -23,8 +24,22 @@ pub enum AgentEvent {
         name: String,
         arguments: serde_json::Value,
     },
+    /// A tool finished; `content` is the result recorded in history.
+    ToolFinished {
+        name: String,
+        arguments: serde_json::Value,
+        content: String,
+        is_error: bool,
+    },
     /// Something worth telling the user that is not part of the reply.
     Notice(String),
+}
+
+/// How a turn ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnOutcome {
+    Completed,
+    Interrupted,
 }
 
 /// A model bound to a tool set and an execution context.
@@ -62,6 +77,37 @@ impl<M: Model> Agent<M> {
         input: impl Into<String>,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> anyhow::Result<()> {
+        self.run_turn_stream_cancellable(history, input, on_event, std::future::pending::<()>())
+            .await?;
+        Ok(())
+    }
+
+    /// Runs one user turn until it completes or `cancel` resolves.
+    ///
+    /// Cancellation is cooperative: the in-flight model request or tool future
+    /// is dropped. Text already emitted for an unfinished model step is not
+    /// written to history.
+    pub async fn run_turn_stream_cancellable<C>(
+        &self,
+        history: &mut Vec<Item>,
+        input: impl Into<String>,
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
+        cancel: C,
+    ) -> anyhow::Result<TurnOutcome>
+    where
+        C: Future<Output = ()> + Send,
+    {
+        let mut cancel = std::pin::pin!(cancel);
+
+        // Observe an already-completed cancellation future before touching
+        // history. The ready arm makes the select return immediately when the
+        // cancellation future is still pending.
+        tokio::select! {
+            biased;
+            _ = &mut cancel => return Ok(TurnOutcome::Interrupted),
+            _ = std::future::ready(()) => {}
+        }
+
         history.push(Item::UserMessage(input.into()));
 
         let definitions = self.tools.definitions();
@@ -84,10 +130,13 @@ impl<M: Model> Agent<M> {
             let ModelResponse {
                 content,
                 tool_calls,
-            } = self
-                .model
-                .complete_stream(history, &definitions, &mut sink)
-                .await?;
+            } = tokio::select! {
+                biased;
+                _ = &mut cancel => return Ok(TurnOutcome::Interrupted),
+                response = self
+                    .model
+                    .complete_stream(history, &definitions, &mut sink) => response?,
+            };
 
             let text = content.filter(|text| !text.trim().is_empty());
 
@@ -96,7 +145,7 @@ impl<M: Model> Agent<M> {
                     anyhow::bail!("the model returned an empty response");
                 };
                 history.push(Item::AssistantMessage(text));
-                return Ok(());
+                return Ok(TurnOutcome::Completed);
             }
 
             if let Some(text) = text {
@@ -104,7 +153,11 @@ impl<M: Model> Agent<M> {
             }
 
             for call in tool_calls {
-                self.run_tool(history, call, on_event).await;
+                tokio::select! {
+                    biased;
+                    _ = &mut cancel => return Ok(TurnOutcome::Interrupted),
+                    () = self.run_tool(history, call, on_event) => {}
+                }
             }
         }
 
@@ -144,11 +197,17 @@ impl<M: Model> Agent<M> {
 
         history.push(Item::ToolCall(ToolCall {
             id: call.id.clone(),
-            name: call.name,
-            arguments,
+            name: call.name.clone(),
+            arguments: arguments.clone(),
         }));
         history.push(Item::ToolResult {
             tool_call_id: call.id,
+            content: content.clone(),
+            is_error,
+        });
+        on_event(AgentEvent::ToolFinished {
+            name: call.name,
+            arguments,
             content,
             is_error,
         });
