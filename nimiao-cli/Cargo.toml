@@ -19,3 +19,8 @@ model = { path = "../model" }
 engine = { path = "../engine" }
 sandbox = { path = "../sandbox" }
 tools = { path = "../tools" }
+crossterm.workspace = true
+futures-util.workspace = true
+ratatui.workspace = true
+ratatui-textarea.workspace = true
+unicode-width.workspace = true
