@@ -1,11 +1,12 @@
 //! Agent-loop events, driven by a scripted model.
 
 use async_trait::async_trait;
-use engine::{Agent, AgentEvent};
+use engine::{Agent, AgentEvent, TurnOutcome};
 use model::{Model, ModelEvent, ModelResponse};
 use protocol::{Item, ToolCall, ToolDefinition};
 use serde_json::json;
 use std::sync::Mutex;
+use std::time::Duration;
 use tools::{Tool, ToolContext, ToolOutput, ToolRegistry};
 
 /// A model that replays a fixed script of steps.
@@ -88,6 +89,10 @@ impl Tool for EchoTool {
 }
 
 fn agent(model: ScriptedModel) -> Agent<ScriptedModel> {
+    agent_with_model(model)
+}
+
+fn agent_with_model<M: Model>(model: M) -> Agent<M> {
     let ctx = ToolContext::new(sandbox::Sandbox::current().unwrap());
     let registry = ToolRegistry::new(vec![Box::new(EchoTool)]);
     Agent::new(model, registry, ctx)
@@ -130,6 +135,12 @@ async fn reports_text_then_tools_then_text() {
             AgentEvent::ToolStarted {
                 name: "echo".to_string(),
                 arguments: json!({"command": "ls"}),
+            },
+            AgentEvent::ToolFinished {
+                name: "echo".to_string(),
+                arguments: json!({"command": "ls"}),
+                content: "{\"command\":\"ls\"}".to_string(),
+                is_error: false,
             },
             AgentEvent::Text("done.".to_string()),
         ]
@@ -238,8 +249,12 @@ async fn records_an_unknown_tool_as_an_error_result() {
     ]);
     let agent = agent(model);
     let mut history = vec![];
+    let mut events = vec![];
 
-    agent.run_turn(&mut history, "go").await.unwrap();
+    agent
+        .run_turn_stream(&mut history, "go", &mut |event| events.push(event))
+        .await
+        .unwrap();
 
     match &history[2] {
         Item::ToolResult {
@@ -250,6 +265,21 @@ async fn records_an_unknown_tool_as_an_error_result() {
         }
         other => panic!("expected a tool result, got {other:?}"),
     }
+    let finished = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolFinished {
+                name,
+                content,
+                is_error,
+                ..
+            } => Some((name.as_str(), content.as_str(), *is_error)),
+            _ => None,
+        })
+        .expect("tool completion event");
+    assert_eq!(finished.0, "missing");
+    assert!(finished.1.contains("unknown tool"), "{}", finished.1);
+    assert!(finished.2);
 }
 
 #[tokio::test]
@@ -296,8 +326,12 @@ async fn records_a_failing_tool_as_an_error_result() {
     let ctx = ToolContext::new(sandbox::Sandbox::current().unwrap());
     let agent = Agent::new(model, ToolRegistry::new(vec![Box::new(FailingTool)]), ctx);
     let mut history = vec![];
+    let mut events = vec![];
 
-    agent.run_turn(&mut history, "go").await.unwrap();
+    agent
+        .run_turn_stream(&mut history, "go", &mut |event| events.push(event))
+        .await
+        .unwrap();
 
     match &history[2] {
         Item::ToolResult {
@@ -308,6 +342,181 @@ async fn records_a_failing_tool_as_an_error_result() {
         }
         other => panic!("expected a tool result, got {other:?}"),
     }
+    let finished = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolFinished {
+                name,
+                content,
+                is_error,
+                ..
+            } => Some((name.as_str(), content.as_str(), *is_error)),
+            _ => None,
+        })
+        .expect("tool completion event");
+    assert_eq!(finished.0, "fail");
+    assert!(finished.1.contains("the tool broke"), "{}", finished.1);
+    assert!(finished.2);
+}
+
+#[tokio::test]
+async fn cancellation_before_the_request_leaves_history_untouched() {
+    let agent = agent(ScriptedModel::new(vec![]));
+    let mut history = vec![];
+    let mut events = vec![];
+
+    let outcome = agent
+        .run_turn_stream_cancellable(
+            &mut history,
+            "go",
+            &mut |event| events.push(event),
+            std::future::ready(()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, TurnOutcome::Interrupted);
+    assert!(history.is_empty());
+    assert!(events.is_empty());
+}
+
+#[tokio::test]
+async fn cancellation_while_streaming_keeps_partial_text_out_of_history() {
+    struct HangingModel {
+        cancel: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl Model for HangingModel {
+        fn name(&self) -> &str {
+            "hanging"
+        }
+
+        async fn complete(
+            &self,
+            _history: &[Item],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<ModelResponse> {
+            panic!("the agent must stream, not call complete");
+        }
+
+        async fn complete_stream(
+            &self,
+            _history: &[Item],
+            _tools: &[ToolDefinition],
+            on_event: &mut (dyn FnMut(ModelEvent) + Send),
+        ) -> anyhow::Result<ModelResponse> {
+            on_event(ModelEvent::Text("partial".to_string()));
+            if let Some(sender) = self.cancel.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+    }
+
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let model = HangingModel {
+        cancel: Mutex::new(Some(cancel_tx)),
+    };
+    let agent = agent_with_model(model);
+    let mut history = vec![];
+    let mut events = vec![];
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        agent.run_turn_stream_cancellable(
+            &mut history,
+            "go",
+            &mut |event| events.push(event),
+            async move {
+                let _ = cancel_rx.await;
+            },
+        ),
+    )
+    .await
+    .expect("cancellation completed the turn")
+    .unwrap();
+
+    assert_eq!(outcome, TurnOutcome::Interrupted);
+    assert_eq!(events, [AgentEvent::Text("partial".to_string())]);
+    assert_eq!(history.len(), 1);
+    assert!(matches!(history[0], Item::UserMessage(_)));
+}
+
+#[tokio::test]
+async fn cancellation_during_a_tool_leaves_no_tool_items_in_history() {
+    struct HangingTool {
+        cancel: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl Tool for HangingTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name().to_string(),
+                description: "hangs until canceled".to_string(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> anyhow::Result<ToolOutput> {
+            if let Some(sender) = self.cancel.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+    }
+
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let model = ScriptedModel::new(vec![tool_response(None, "work")]);
+    let ctx = ToolContext::new(sandbox::Sandbox::current().unwrap());
+    let agent = Agent::new(
+        model,
+        ToolRegistry::new(vec![Box::new(HangingTool {
+            cancel: Mutex::new(Some(cancel_tx)),
+        })]),
+        ctx,
+    );
+    let mut history = vec![];
+    let mut events = vec![];
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        agent.run_turn_stream_cancellable(
+            &mut history,
+            "go",
+            &mut |event| events.push(event),
+            async move {
+                let _ = cancel_rx.await;
+            },
+        ),
+    )
+    .await
+    .expect("tool cancellation completed the turn")
+    .unwrap();
+
+    assert_eq!(outcome, TurnOutcome::Interrupted);
+    assert_eq!(
+        events,
+        [AgentEvent::ToolStarted {
+            name: "echo".to_string(),
+            arguments: json!({"command": "work"}),
+        }]
+    );
+    assert_eq!(history.len(), 1);
+    assert!(matches!(history[0], Item::UserMessage(_)));
 }
 
 #[tokio::test]
