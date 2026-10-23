@@ -199,6 +199,12 @@ pull requests target `develop`.
 
 ## Releases
 
+**0.0.3.** The interactive client is now a full-screen TUI built with ratatui:
+a live transcript, a multi-line composer, a prompt queue, cancellation,
+Markdown rendering, scrolling, and a detail page for full tool output.
+Redirected streams and `--plain` keep the line-oriented REPL. See
+[Interactive client](#interactive-client).
+
 **0.0.2.** Replies stream from an OpenAI-compatible endpoint as server-sent
 events, rendered as they arrive. Each tool call prints one status line before it
 runs, and endpoints that cannot stream fall back to a one-shot reply with a note

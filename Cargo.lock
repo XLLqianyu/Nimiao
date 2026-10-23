@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "engine"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "execpolicy"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
 ]
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "model"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -913,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "nimiao-cli"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1341,7 +1341,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sandbox"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
 ]
@@ -1746,7 +1746,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "async-trait",
