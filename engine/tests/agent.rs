@@ -5,7 +5,7 @@ use engine::{Agent, AgentEvent, TurnOutcome};
 use model::{Model, ModelEvent, ModelResponse, StopReason};
 use protocol::{Item, ToolCall, ToolDefinition};
 use serde_json::json;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tools::{Tool, ToolContext, ToolOutput, ToolRegistry};
 
@@ -105,6 +105,7 @@ fn tool_response(text: Option<&str>, command: &str) -> ModelResponse {
             id: "call_1".to_string(),
             name: "echo".to_string(),
             arguments: json!({"command": command}),
+            arguments_error: None,
         }],
         stop_reason: Some(StopReason::ToolCalls),
     }
@@ -318,6 +319,77 @@ async fn notices_a_reply_cut_short_without_tool_calls() {
 }
 
 #[tokio::test]
+async fn does_not_run_a_call_whose_arguments_did_not_parse() {
+    struct RecordingTool {
+        ran: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    #[async_trait]
+    impl Tool for RecordingTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name().to_string(),
+                description: "records every execution".to_string(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> anyhow::Result<ToolOutput> {
+            self.ran.lock().unwrap().push(args);
+            Ok(ToolOutput::success("ran"))
+        }
+    }
+
+    let ran = Arc::new(Mutex::new(vec![]));
+    let mut malformed = ToolCall::new("call_1", "echo", json!({}));
+    malformed.arguments_error = Some("expected value\n\nReceived arguments:\n{oops".to_string());
+    let model = ScriptedModel::new(vec![
+        ModelResponse {
+            content: None,
+            tool_calls: vec![malformed],
+            stop_reason: None,
+        },
+        ModelResponse {
+            content: Some("retrying".to_string()),
+            tool_calls: vec![],
+            stop_reason: None,
+        },
+    ]);
+    let ctx = ToolContext::new(sandbox::Sandbox::current().unwrap());
+    let agent = Agent::new(
+        model,
+        ToolRegistry::new(vec![Box::new(RecordingTool {
+            ran: Arc::clone(&ran),
+        })]),
+        ctx,
+    );
+    let mut history = vec![];
+
+    agent.run_turn(&mut history, "go").await.unwrap();
+
+    assert!(ran.lock().unwrap().is_empty(), "the tool must not run");
+    match &history[2] {
+        Item::ToolResult {
+            content, is_error, ..
+        } => {
+            assert!(is_error);
+            assert!(content.contains("Invalid arguments for tool \"echo\""));
+            // The text the model sent comes back to it, not an empty object.
+            assert!(content.contains("{oops"), "{content}");
+        }
+        other => panic!("expected a tool result, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn records_an_unknown_tool_as_an_error_result() {
     let model = ScriptedModel::new(vec![
         ModelResponse {
@@ -326,6 +398,7 @@ async fn records_an_unknown_tool_as_an_error_result() {
                 id: "call_1".to_string(),
                 name: "missing".to_string(),
                 arguments: json!({}),
+                arguments_error: None,
             }],
             stop_reason: None,
         },
@@ -404,6 +477,7 @@ async fn records_a_failing_tool_as_an_error_result() {
                 id: "call_1".to_string(),
                 name: "fail".to_string(),
                 arguments: json!({}),
+                arguments_error: None,
             }],
             stop_reason: None,
         },
@@ -656,11 +730,13 @@ async fn runs_several_tool_calls_in_one_round() {
                     id: "call_1".to_string(),
                     name: "echo".to_string(),
                     arguments: json!({"command": "one"}),
+                    arguments_error: None,
                 },
                 ToolCall {
                     id: "call_2".to_string(),
                     name: "echo".to_string(),
                     arguments: json!({"command": "two"}),
+                    arguments_error: None,
                 },
             ],
             stop_reason: None,

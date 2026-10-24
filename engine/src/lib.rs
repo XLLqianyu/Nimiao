@@ -208,24 +208,29 @@ impl<M: Model> Agent<M> {
         call: ToolCall,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) {
-        let arguments = call.arguments;
+        let arguments = call.arguments.clone();
         on_event(AgentEvent::ToolStarted {
             name: call.name.clone(),
             arguments: arguments.clone(),
         });
-        let (content, is_error) = match self.tools.get(&call.name) {
-            Some(tool) => match tool.execute(arguments.clone(), &self.ctx).await {
-                Ok(output) => (output.content, output.is_error),
-                Err(err) => (format!("{err:#}"), true),
+        // Malformed arguments never reach the tool: it would only fail on a
+        // schema it cannot see. The text the model sent goes back to it
+        // instead, so it can retry with something parseable.
+        let (content, is_error) = match call.arguments_error.as_deref() {
+            Some(error) => (
+                format!("Invalid arguments for tool \"{}\": {error}", call.name),
+                true,
+            ),
+            None => match self.tools.get(&call.name) {
+                Some(tool) => match tool.execute(arguments.clone(), &self.ctx).await {
+                    Ok(output) => (output.content, output.is_error),
+                    Err(err) => (format!("{err:#}"), true),
+                },
+                None => (format!("unknown tool '{}'", call.name), true),
             },
-            None => (format!("unknown tool '{}'", call.name), true),
         };
 
-        history.push(Item::ToolCall(ToolCall {
-            id: call.id.clone(),
-            name: call.name.clone(),
-            arguments: arguments.clone(),
-        }));
+        history.push(Item::ToolCall(call.clone()));
         history.push(Item::ToolResult {
             tool_call_id: call.id,
             content: content.clone(),
