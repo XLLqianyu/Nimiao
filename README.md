@@ -205,39 +205,56 @@ body still carries a valid `{}` for that call, because providers require
 
 ## Safety
 
-Two layers, neither of which is a security boundary on its own:
+Nimiao runs a model's instructions on your machine, so it defends against the
+mistakes and injected commands it can see before running anything. None of
+these layers is a security boundary on its own: the real boundary is the
+workspace sandbox plus whatever OS-level isolation you put around it.
 
-**Sandbox.** Every model-supplied path is resolved against the workspace root
-and rejected if it escapes. The check canonicalizes the deepest existing
-ancestor, so `..` traversal and symlink escapes are caught, while paths that do
-not exist yet are still accepted for writes. Windows device paths (`\\.\`,
-`\\?\GLOBALROOT`, named pipes) are refused outright.
+**What is defended.**
 
-**Command screening.** `execpolicy` tokenizes a command, splits it on shell
-separators, unwraps launchers such as `sudo`, `env`, and `xargs`, recurses into
-nested `bash -c` payloads, and blocks a short list of catastrophic operations:
-recursive deletes aimed at system roots, disk formatting, `dd` to a raw device,
-and fork bombs. It also looks through the wrappers that hide a command from a
-first reading: `$(...)`, backticks and `<( )` substitutions; `find`'s `-delete`
-and `-exec` family; and backslashes inside a program name (`r\m`). A pipe that
-feeds a shell or an interpreter with no script of its own (`curl … | sh`) is
-refused, because the code it runs never appears in the command line. A
-redirection that would write outside the workspace (`> /etc/passwd`,
-`> ../../x`) is refused as well; `> /dev/null`, `2>&1` and a path inside the
-workspace are fine. The comparison is lexical, so a symlink inside the
-workspace that points outside it is not caught.
+- *Paths.* Every model-supplied path is resolved against the workspace root and
+  rejected if it escapes. The check canonicalizes the deepest existing
+  ancestor, so `..` traversal and symlink escapes are caught, while paths that
+  do not exist yet are still accepted for writes. Windows device paths
+  (`\\.\`, `\\?\GLOBALROOT`, named pipes) are refused outright.
+- *Commands.* `execpolicy` tokenizes a command, splits it on shell separators,
+  unwraps launchers such as `sudo`, `env`, and `xargs`, recurses into nested
+  `bash -c` payloads, and blocks a short list of catastrophic operations:
+  recursive deletes aimed at system roots, disk formatting, `dd` to a raw
+  device, and fork bombs.
+- *One level of wrapper.* It looks through `$(...)`, backticks and `<( )`
+  substitutions; `find`'s `-delete` and `-exec` family; and backslashes inside
+  a program name (`r\m`). A pipe that feeds a shell or an interpreter with no
+  script of its own (`curl … | sh`) is refused, because the code it runs never
+  appears in the command line.
+- *Redirections.* A target that would write outside the workspace
+  (`> /etc/passwd`, `> ../../x`, `> ~/.bashrc`) is refused. `> /dev/null`,
+  `2>&1`, and paths inside the workspace are fine. The comparison is lexical:
+  a symlink inside the workspace that points outside it is not caught.
+- *The environment.* Shell commands run with stdin set to null, are killed as a
+  process tree on timeout, and do not inherit `OPENAI_API_KEY`,
+  `OPENAI_BASE_URL`, or `OPENAI_MODEL_NAME`. The command is model-authored, so
+  leaving the key in reach would turn one prompt injection into a leak. The
+  rest of the environment, including `PATH` and `HOME`, passes through.
 
-It is a best-effort static check. It does **not** see: a command assembled from
-variables, a script stored on disk, an interpreter not on its list, nesting
-deeper than 8 levels, shell aliases and functions, or anything an `ssh` session
-does on the far side. It cannot see what a script does after it starts.
+**What is not defended.** These are known and accepted, not oversights:
 
-Shell commands run with stdin set to null and are killed as a process tree on
-timeout, so nothing is left holding the pipes. They also run without
-`OPENAI_API_KEY`, `OPENAI_BASE_URL`, or `OPENAI_MODEL_NAME` in their
-environment: the command is model-authored, so leaving the key in reach would
-turn one prompt injection into a leak. The rest of the environment, including
-`PATH` and `HOME`, is passed through so ordinary commands work.
+- A command assembled at runtime from variables, or a program name that is
+  itself computed (`$X -rf /`), because the value is not known until the shell
+  expands it.
+- A script already on disk: `check_command` sees `./deploy.sh`, not its
+  contents, and cannot see what any command does after it starts.
+- An interpreter or downloader not on the screening list.
+- Nesting deeper than 8 levels, and shell aliases, functions, and `source`d
+  profiles.
+- Anything an `ssh`, `docker exec`, or similar remote session does on the far
+  side.
+- Symlinks inside the workspace that point outside it: tool paths are safe,
+  because the sandbox canonicalizes them, but the redirect check is lexical and
+  does not resolve them.
+- Resource exhaustion: a command that is not catastrophic but is merely slow,
+  hungry, or long-running is bounded only by the 600-second timeout, its output
+  cap, and the 32-round step limit.
 
 ## Development
 
