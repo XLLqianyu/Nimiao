@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use engine::{Agent, AgentEvent, TurnOutcome};
-use model::{Model, ModelEvent, ModelResponse};
+use model::{Model, ModelEvent, ModelResponse, StopReason};
 use protocol::{Item, ToolCall, ToolDefinition};
 use serde_json::json;
 use std::sync::Mutex;
@@ -106,6 +106,7 @@ fn tool_response(text: Option<&str>, command: &str) -> ModelResponse {
             name: "echo".to_string(),
             arguments: json!({"command": command}),
         }],
+        stop_reason: Some(StopReason::ToolCalls),
     }
 }
 
@@ -116,6 +117,7 @@ async fn reports_text_then_tools_then_text() {
         ModelResponse {
             content: Some("done.".to_string()),
             tool_calls: vec![],
+            stop_reason: None,
         },
     ]);
     let agent = agent(model);
@@ -162,6 +164,7 @@ async fn announces_a_fallback_only_once_per_turn() {
             ModelResponse {
                 content: Some("done.".to_string()),
                 tool_calls: vec![],
+                stop_reason: None,
             },
         ]),
         falls_back: true,
@@ -187,6 +190,7 @@ async fn run_turn_works_without_a_sink() {
     let model = ScriptedModel::new(vec![ModelResponse {
         content: Some("hi".to_string()),
         tool_calls: vec![],
+        stop_reason: None,
     }]);
     let agent = agent(model);
     let mut history = vec![];
@@ -201,6 +205,7 @@ async fn rejects_an_empty_reply() {
     let model = ScriptedModel::new(vec![ModelResponse {
         content: Some("   ".to_string()),
         tool_calls: vec![],
+        stop_reason: None,
     }]);
     let agent = agent(model);
     let mut history = vec![];
@@ -232,6 +237,87 @@ async fn stops_at_the_step_limit() {
 }
 
 #[tokio::test]
+async fn does_not_run_tool_calls_from_a_truncated_reply() {
+    let mut step = tool_response(None, "ls");
+    step.stop_reason = Some(StopReason::Length);
+    let model = ScriptedModel::new(vec![step]);
+    let agent = agent(model);
+    let mut history = vec![];
+    let mut finished = vec![];
+
+    let error = agent
+        .run_turn_stream(&mut history, "go", &mut |event| {
+            if let AgentEvent::ToolFinished {
+                name,
+                content,
+                is_error,
+                ..
+            } = event
+            {
+                finished.push((name, content, is_error));
+            }
+        })
+        .await
+        .unwrap_err();
+
+    assert!(format!("{error:#}").contains("truncated"), "{error:#}");
+    assert_eq!(finished.len(), 1, "{finished:?}");
+    let (name, content, is_error) = &finished[0];
+    assert_eq!(name, "echo");
+    assert!(is_error);
+    assert!(content.contains("output token limit"), "{content}");
+    // The call is still recorded, with a failure result: dropping it would
+    // leave the assistant message unanswered.
+    assert_eq!(history.len(), 3, "{history:?}");
+    assert!(matches!(history[1], Item::ToolCall(_)));
+    assert!(matches!(
+        history[2],
+        Item::ToolResult { is_error: true, .. }
+    ));
+}
+
+#[tokio::test]
+async fn reports_a_content_filtered_reply_as_an_error() {
+    let model = ScriptedModel::new(vec![ModelResponse {
+        content: None,
+        tool_calls: vec![],
+        stop_reason: Some(StopReason::ContentFilter),
+    }]);
+    let agent = agent(model);
+    let mut history = vec![];
+
+    let error = agent
+        .run_turn_stream(&mut history, "go", &mut |_| {})
+        .await
+        .unwrap_err();
+
+    assert!(format!("{error:#}").contains("content_filter"), "{error:#}");
+}
+
+#[tokio::test]
+async fn notices_a_reply_cut_short_without_tool_calls() {
+    let model = ScriptedModel::new(vec![ModelResponse {
+        content: Some("a long answer".to_string()),
+        tool_calls: vec![],
+        stop_reason: Some(StopReason::Length),
+    }]);
+    let agent = agent(model);
+    let mut history = vec![];
+    let mut events = vec![];
+
+    agent
+        .run_turn_stream(&mut history, "go", &mut |event| events.push(event))
+        .await
+        .unwrap();
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(message) if message.contains("output token limit")
+    )));
+    assert!(matches!(history.last(), Some(Item::AssistantMessage(_))));
+}
+
+#[tokio::test]
 async fn records_an_unknown_tool_as_an_error_result() {
     let model = ScriptedModel::new(vec![
         ModelResponse {
@@ -241,10 +327,12 @@ async fn records_an_unknown_tool_as_an_error_result() {
                 name: "missing".to_string(),
                 arguments: json!({}),
             }],
+            stop_reason: None,
         },
         ModelResponse {
             content: Some("done".to_string()),
             tool_calls: vec![],
+            stop_reason: None,
         },
     ]);
     let agent = agent(model);
@@ -317,10 +405,12 @@ async fn records_a_failing_tool_as_an_error_result() {
                 name: "fail".to_string(),
                 arguments: json!({}),
             }],
+            stop_reason: None,
         },
         ModelResponse {
             content: Some("done".to_string()),
             tool_calls: vec![],
+            stop_reason: None,
         },
     ]);
     let ctx = ToolContext::new(sandbox::Sandbox::current().unwrap());
@@ -542,6 +632,7 @@ async fn records_text_that_arrives_with_tool_calls() {
         ModelResponse {
             content: Some("done.".to_string()),
             tool_calls: vec![],
+            stop_reason: None,
         },
     ]);
     let agent = agent(model);
@@ -572,10 +663,12 @@ async fn runs_several_tool_calls_in_one_round() {
                     arguments: json!({"command": "two"}),
                 },
             ],
+            stop_reason: None,
         },
         ModelResponse {
             content: Some("done".to_string()),
             tool_calls: vec![],
+            stop_reason: None,
         },
     ]);
     let agent = agent(model);

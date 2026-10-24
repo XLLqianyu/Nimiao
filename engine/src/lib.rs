@@ -5,7 +5,7 @@
 //! step, runs whatever tools it asks for, and repeats until the model answers
 //! without further tool calls.
 
-use model::{Model, ModelEvent, ModelResponse};
+use model::{Model, ModelEvent, ModelResponse, StopReason};
 use protocol::{Item, ToolCall};
 use std::future::Future;
 use tools::{ToolContext, ToolRegistry};
@@ -130,6 +130,7 @@ impl<M: Model> Agent<M> {
             let ModelResponse {
                 content,
                 tool_calls,
+                stop_reason,
             } = tokio::select! {
                 biased;
                 _ = &mut cancel => return Ok(TurnOutcome::Interrupted),
@@ -138,7 +139,32 @@ impl<M: Model> Agent<M> {
                     .complete_stream(history, &definitions, &mut sink) => response?,
             };
 
+            if stop_reason == Some(StopReason::ContentFilter) {
+                anyhow::bail!("Provider finish_reason: content_filter");
+            }
+
             let text = content.filter(|text| !text.trim().is_empty());
+
+            // A reply cut off at the token limit may carry calls whose
+            // arguments were truncated mid-word. None of them is trustworthy,
+            // so record every one as failed instead of running any.
+            if stop_reason == Some(StopReason::Length) && !tool_calls.is_empty() {
+                for call in tool_calls {
+                    record_unexecuted(
+                        history,
+                        call,
+                        "the response hit the output token limit, so its arguments may be truncated",
+                        on_event,
+                    );
+                }
+                anyhow::bail!("the reply was truncated before the tool calls were complete");
+            }
+
+            if stop_reason == Some(StopReason::Length) {
+                on_event(AgentEvent::Notice(
+                    "the reply hit the output token limit and was cut short".to_string(),
+                ));
+            }
 
             if tool_calls.is_empty() {
                 let Some(text) = text else {
@@ -212,4 +238,38 @@ impl<M: Model> Agent<M> {
             is_error,
         });
     }
+}
+
+/// Records a call the model declared but that must not run, with a failure
+/// result explaining why.
+///
+/// The call still goes into history: a history in which a declared call has no
+/// result is rejected by providers, so the failure result is what keeps the
+/// transcript replayable.
+fn record_unexecuted(
+    history: &mut Vec<Item>,
+    call: ToolCall,
+    reason: &str,
+    on_event: &mut (dyn FnMut(AgentEvent) + Send),
+) {
+    let content = format!(
+        "Tool call \"{}\" was not executed: {reason}. Re-issue the tool call with complete arguments.",
+        call.name
+    );
+    on_event(AgentEvent::ToolStarted {
+        name: call.name.clone(),
+        arguments: call.arguments.clone(),
+    });
+    history.push(Item::ToolCall(call.clone()));
+    history.push(Item::ToolResult {
+        tool_call_id: call.id.clone(),
+        content: content.clone(),
+        is_error: true,
+    });
+    on_event(AgentEvent::ToolFinished {
+        name: call.name,
+        arguments: call.arguments,
+        content,
+        is_error: true,
+    });
 }

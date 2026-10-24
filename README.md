@@ -134,6 +134,15 @@ In all four cases the reply is still correct and a gray `note:` line on stderr
 says the endpoint did not stream. Other failures, such as an invalid key or a
 rate limit, are reported as errors and are not retried.
 
+**Stop reasons.** The provider's `finish_reason` is honoured. A reply cut off
+at the output token limit with tool calls in it has none of those calls run:
+their arguments may be truncated mid-value, so each is recorded as a failed
+result telling the model to re-issue it, and the turn ends with an error. A
+cut-off reply without tool calls is kept and a note says it was shortened. A
+`content_filter` finish is reported as an error naming it, rather than as the
+misleading "empty response". A provider that omits `finish_reason` altogether,
+as some proxies do, is accepted.
+
 ## Workspace layout
 
 | Crate | Responsibility |

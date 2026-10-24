@@ -1,5 +1,5 @@
 use crate::sse::SseDecoder;
-use crate::{Model, ModelEvent, ModelResponse, ToolDefinition};
+use crate::{Model, ModelEvent, ModelResponse, StopReason, ToolDefinition};
 use anyhow::Context;
 use async_trait::async_trait;
 use protocol::{Item, ToolCall};
@@ -199,6 +199,7 @@ impl OpenAIModel {
         Ok(ModelResponse {
             content,
             tool_calls,
+            stop_reason: map_stop_reason(&choice["finish_reason"]),
         })
     }
 
@@ -387,6 +388,8 @@ struct StreamState {
     raw: Vec<u8>,
     text: String,
     calls: ToolCallAccumulator,
+    /// The last `finish_reason` seen, kept across frames.
+    stop_reason: Option<StopReason>,
 }
 
 impl StreamState {
@@ -396,6 +399,7 @@ impl StreamState {
             raw: Vec::new(),
             text: String::new(),
             calls: ToolCallAccumulator::default(),
+            stop_reason: None,
         }
     }
 
@@ -450,6 +454,9 @@ impl StreamState {
                 self.calls.push(call);
             }
         }
+        // A finish reason may arrive on any frame of a stream, usually the
+        // last one, so the latest value wins.
+        self.stop_reason = map_stop_reason(&choice["finish_reason"]).or(self.stop_reason.take());
     }
 
     fn finish(self) -> ModelResponse {
@@ -461,7 +468,23 @@ impl StreamState {
         ModelResponse {
             content,
             tool_calls: self.calls.finish(),
+            stop_reason: self.stop_reason,
         }
+    }
+}
+
+/// Maps a provider `finish_reason` onto a [`StopReason`].
+///
+/// `null`, a missing field, and an unknown string are all reported as `None`
+/// or `Other`: this client must still work against proxies that do not report
+/// a reason the way OpenAI does.
+fn map_stop_reason(reason: &Value) -> Option<StopReason> {
+    match reason.as_str()? {
+        "stop" | "end" => Some(StopReason::Stop),
+        "length" => Some(StopReason::Length),
+        "tool_calls" | "function_call" => Some(StopReason::ToolCalls),
+        "content_filter" => Some(StopReason::ContentFilter),
+        other => Some(StopReason::Other(other.to_string())),
     }
 }
 
