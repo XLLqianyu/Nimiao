@@ -146,9 +146,6 @@ impl Tool for BashTool {
         for name in SECRET_ENVIRONMENT {
             command.env_remove(name);
         }
-        // The model configures this process, and a prompt injection only has
-        // to ask it to curl the value out. Clearing the whole environment
-        // would also drop PATH and HOME, which ordinary commands need.
 
         let mut child = command
             .spawn()
