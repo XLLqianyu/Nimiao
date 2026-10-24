@@ -92,8 +92,9 @@ Do not weaken these in passing:
 
 - Every model-supplied path goes through `Sandbox::validate_path`. Do not join
   against the workspace root by hand.
-- Every shell command goes through `execpolicy::check_command` before it
-  reaches a shell.
+- Every shell command goes through `execpolicy::check_command` — or
+  `check_command_in` with the workspace root, which also refuses a redirection
+  that would write outside it — before it reaches a shell.
 - Every `ToolCall` written to history is followed immediately by exactly one
   `ToolResult`, in the order the calls were declared, and a turn that ends
   early appends a closing assistant message. `engine/src/lib.rs` documents the
