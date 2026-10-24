@@ -13,6 +13,9 @@ struct TestWorkspace {
     ctx: ToolContext,
 }
 
+/// Distinguishes the outside-workspace probe paths below.
+static OUTSIDE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 impl TestWorkspace {
     fn new(tag: &str) -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -380,6 +383,64 @@ async fn bash_blocks_destructive_commands() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("blocked"));
+}
+
+#[tokio::test]
+async fn bash_blocks_a_redirect_outside_the_workspace() {
+    let workspace = TestWorkspace::new("bash-redirect-outside");
+    let outside = std::env::temp_dir().join(format!(
+        "nimiao-redirect-probe-{}-{}",
+        std::process::id(),
+        OUTSIDE_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+
+    let error = run(
+        &BashTool,
+        json!({"command": format!("echo hi > {}", outside.display())}),
+        &workspace.ctx,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("blocked"), "{error}");
+    assert!(!outside.exists(), "nothing should have been written");
+}
+
+#[tokio::test]
+async fn bash_writes_a_redirect_inside_the_workspace() {
+    let workspace = TestWorkspace::new("bash-redirect-inside");
+
+    let Ok(output) = run(
+        &BashTool,
+        json!({"command": "echo hi > out.txt && cat out.txt"}),
+        &workspace.ctx,
+    )
+    .await
+    else {
+        return;
+    };
+
+    assert!(!output.is_error);
+    assert!(output.content.contains("hi"), "{}", output.content);
+    assert!(workspace.path("out.txt").exists());
+}
+
+#[tokio::test]
+async fn bash_allows_the_null_device() {
+    let workspace = TestWorkspace::new("bash-redirect-null");
+
+    let Ok(output) = run(
+        &BashTool,
+        json!({"command": "echo hi > /dev/null 2>&1; echo done"}),
+        &workspace.ctx,
+    )
+    .await
+    else {
+        return;
+    };
+
+    assert!(!output.is_error, "{}", output.content);
+    assert!(output.content.contains("done"));
 }
 
 #[tokio::test]

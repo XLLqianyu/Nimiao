@@ -118,7 +118,9 @@ impl Tool for BashTool {
             }
         };
 
-        execpolicy::check_command(&args.command)?;
+        // The workspace root lets the screening refuse a redirection that
+        // would write outside it, such as `> /etc/passwd`.
+        execpolicy::check_command_in(&args.command, Some(ctx.workspace_root()))?;
 
         let shell = resolve_shell()
             .context("No bash executable found. Install Git for Windows or put bash on PATH")?;
