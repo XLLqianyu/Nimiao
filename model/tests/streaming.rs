@@ -187,11 +187,7 @@ async fn sent_body(history: &[Item], tools: &[protocol::ToolDefinition]) -> serd
 }
 
 fn call(id: &str, name: &str, arguments: serde_json::Value) -> Item {
-    Item::ToolCall(protocol::ToolCall {
-        id: id.to_string(),
-        name: name.to_string(),
-        arguments,
-    })
+    Item::ToolCall(protocol::ToolCall::new(id, name, arguments))
 }
 
 #[tokio::test]
@@ -867,7 +863,8 @@ async fn keeps_an_unknown_finish_reason_as_other() {
 
 #[tokio::test]
 async fn keeps_a_finished_tool_call_whose_arguments_are_not_json() {
-    // A malformed fragment must not lose the call; it becomes `{}` as before.
+    // The call is kept so the history stays answerable, but `{}` alone would
+    // hide what the model actually said. The text it sent is kept beside it.
     let (model, _) = model_replying(vec![Reply::sse(
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"not json\"}}]}}]}\n\n\
          data: [DONE]\n\n",
@@ -879,4 +876,76 @@ async fn keeps_a_finished_tool_call_whose_arguments_are_not_json() {
     assert_eq!(response.tool_calls.len(), 1);
     assert_eq!(response.tool_calls[0].name, "bash");
     assert_eq!(response.tool_calls[0].arguments, serde_json::json!({}));
+    let error = response.tool_calls[0]
+        .arguments_error
+        .as_deref()
+        .expect("the malformed text must be kept");
+    assert!(error.contains("Received arguments:\nnot json"), "{error}");
+}
+
+#[tokio::test]
+async fn keeps_a_finished_tool_call_whose_arguments_are_not_an_object() {
+    // Valid JSON that is not an object cannot be replayed either: providers
+    // require `arguments` to be a JSON object.
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"[1,2]\"}}]}}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(response.tool_calls[0].arguments, serde_json::json!({}));
+    let error = response.tool_calls[0].arguments_error.as_deref().unwrap();
+    assert!(error.contains("must be a JSON object"), "{error}");
+    assert!(error.contains("[1,2]"), "{error}");
+}
+
+#[tokio::test]
+async fn accepts_a_call_with_no_arguments_text() {
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(response.tool_calls[0].arguments, serde_json::json!({}));
+    assert!(response.tool_calls[0].arguments_error.is_none());
+}
+
+#[tokio::test]
+async fn keeps_malformed_arguments_from_a_whole_completion() {
+    let (model, _) = model_replying(vec![Reply::json(
+        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"tool_calls\":[\
+           {\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{oops\"}}]}}]}",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].arguments, serde_json::json!({}));
+    assert!(response.tool_calls[0]
+        .arguments_error
+        .as_deref()
+        .unwrap()
+        .contains("{oops"));
+}
+
+#[tokio::test]
+async fn does_not_send_the_argument_error_on_the_wire() {
+    let mut malformed = protocol::ToolCall::new("call_1", "bash", serde_json::json!({}));
+    malformed.arguments_error = Some("received garbage".to_string());
+    let history = vec![
+        Item::UserMessage("hi".to_string()),
+        Item::ToolCall(malformed),
+    ];
+
+    let body = sent_body(&history, &[]).await;
+    let message = &body["messages"][1];
+
+    assert_eq!(message["tool_calls"][0]["function"]["arguments"], "{}");
+    assert!(message["tool_calls"][0].get("arguments_error").is_none());
 }

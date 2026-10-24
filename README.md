@@ -180,6 +180,13 @@ retries against a normalized copy, tolerating smart quotes, en-dashes, and
 trailing whitespace. Line endings and a byte-order mark are preserved on write.
 Overlapping or non-unique edits are rejected rather than guessed at.
 
+**Malformed tool arguments.** When the model finishes a call whose arguments
+text is not a JSON object, that call is not run: it would only fail against a
+schema it never composed. The result tells the model the arguments were
+invalid and repeats the text it sent, so it can re-issue the call. The request
+body still carries a valid `{}` for that call, because providers require
+`arguments` to be JSON.
+
 ## Safety
 
 Two layers, neither of which is a security boundary on its own:

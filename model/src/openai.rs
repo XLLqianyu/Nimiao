@@ -182,16 +182,16 @@ impl OpenAIModel {
 
         if let Some(tcs) = message["tool_calls"].as_array() {
             for tc in tcs {
+                let (arguments, arguments_error) =
+                    parse_arguments(tc["function"]["arguments"].as_str());
                 tool_calls.push(ToolCall {
                     id: tc["id"].as_str().unwrap_or_default().to_string(),
                     name: tc["function"]["name"]
                         .as_str()
                         .unwrap_or_default()
                         .to_string(),
-                    arguments: serde_json::from_str(
-                        tc["function"]["arguments"].as_str().unwrap_or("{}"),
-                    )
-                    .unwrap_or(json!({})),
+                    arguments,
+                    arguments_error,
                 });
             }
         }
@@ -542,12 +542,49 @@ impl ToolCallAccumulator {
     fn finish(self) -> Vec<ToolCall> {
         self.calls
             .into_values()
-            .map(|call| ToolCall {
-                id: call.id,
-                name: call.name,
-                arguments: serde_json::from_str(&call.arguments).unwrap_or(json!({})),
+            .map(|call| {
+                let (arguments, arguments_error) = parse_arguments(Some(&call.arguments));
+                ToolCall {
+                    id: call.id,
+                    name: call.name,
+                    arguments,
+                    arguments_error,
+                }
             })
             .collect()
+    }
+}
+
+/// Parses a finished call's arguments text.
+///
+/// A finished call whose text is not a JSON object cannot be replayed as-is:
+/// the provider requires `arguments` to be JSON. It becomes `{}` and the text
+/// the model sent is kept beside it, so the tool result can quote it back
+/// instead of the model silently seeing an empty object.
+fn parse_arguments(text: Option<&str>) -> (Value, Option<String>) {
+    let Some(text) = text.filter(|text| !text.trim().is_empty()) else {
+        return (json!({}), None);
+    };
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Object(map)) => (Value::Object(map), None),
+        Ok(other) => (
+            json!({}),
+            Some(format!(
+                "tool arguments must be a JSON object, got {}\n\nReceived arguments:\n{text}",
+                match other {
+                    Value::Null => "null",
+                    Value::Bool(_) => "a boolean",
+                    Value::Number(_) => "a number",
+                    Value::String(_) => "a string",
+                    Value::Array(_) => "an array",
+                    Value::Object(_) => unreachable!(),
+                }
+            )),
+        ),
+        Err(err) => (
+            json!({}),
+            Some(format!("{err}\n\nReceived arguments:\n{text}")),
+        ),
     }
 }
 
