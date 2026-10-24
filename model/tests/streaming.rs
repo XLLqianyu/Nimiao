@@ -5,7 +5,7 @@
 //! request and answers it.
 
 use model::openai::OpenAIModel;
-use model::{Model, ModelEvent, ModelResponse};
+use model::{Model, ModelEvent, ModelResponse, StopReason};
 use protocol::Item;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -779,6 +779,90 @@ async fn ignores_a_delta_without_choices() {
 
     assert_eq!(response.content.as_deref(), Some("x"));
     assert_eq!(events, [ModelEvent::Text("x".to_string())]);
+}
+
+#[tokio::test]
+async fn reports_a_length_finish_reason_from_a_stream() {
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"cut\"}}]}\n\n\
+         data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, events) = stream_events(&model).await;
+
+    assert_eq!(response.stop_reason, Some(StopReason::Length));
+    assert_eq!(events, [ModelEvent::Text("cut".to_string())]);
+}
+
+#[tokio::test]
+async fn reports_a_content_filter_from_a_stream() {
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(response.stop_reason, Some(StopReason::ContentFilter));
+}
+
+#[tokio::test]
+async fn reports_a_tool_calls_finish_reason() {
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
+}
+
+#[tokio::test]
+async fn leaves_the_stop_reason_unset_when_the_provider_omits_it() {
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    // Proxies commonly omit it; that must stay valid rather than fail.
+    assert_eq!(response.stop_reason, None);
+}
+
+#[tokio::test]
+async fn reports_a_finish_reason_from_a_whole_completion() {
+    let (model, _) = model_replying(vec![Reply::json(
+        "{\"choices\":[{\"message\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(response.content.as_deref(), Some("partial"));
+    assert_eq!(response.stop_reason, Some(StopReason::Length));
+}
+
+#[tokio::test]
+async fn keeps_an_unknown_finish_reason_as_other() {
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"network_error\"}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(
+        response.stop_reason,
+        Some(StopReason::Other("network_error".to_string()))
+    );
 }
 
 #[tokio::test]
