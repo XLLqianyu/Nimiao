@@ -58,7 +58,7 @@ async fn model_replying(replies: Vec<Reply>) -> (OpenAIModel, Arc<AtomicUsize>) 
     });
 
     (
-        OpenAIModel::new("test-key", &base_url, "test-model"),
+        OpenAIModel::new("test-key", &base_url, "test-model").unwrap(),
         served,
     )
 }
@@ -172,7 +172,7 @@ async fn sent_body(history: &[Item], tools: &[protocol::ToolDefinition]) -> serd
         let _ = sent.send(request);
     });
 
-    let model = OpenAIModel::new("test-key", &base_url, "test-model");
+    let model = OpenAIModel::new("test-key", &base_url, "test-model").unwrap();
     model
         .complete_stream(history, tools, &mut |_| {})
         .await
@@ -510,7 +510,7 @@ async fn asks_for_an_event_stream() {
         let _ = sent.send(request);
     });
 
-    let model = OpenAIModel::new("test-key", &base_url, "test-model");
+    let model = OpenAIModel::new("test-key", &base_url, "test-model").unwrap();
     model.complete_stream(&[], &[], &mut |_| {}).await.unwrap();
 
     let request = received.await.unwrap().to_ascii_lowercase();
@@ -566,7 +566,7 @@ async fn reads_a_chunked_stream_piece_by_piece() {
     })
     .await;
 
-    let model = OpenAIModel::new("test-key", &base_url, "test-model");
+    let model = OpenAIModel::new("test-key", &base_url, "test-model").unwrap();
     let (response, events) = stream_events(&model).await;
 
     assert_eq!(response.content.as_deref(), Some("abc"));
@@ -597,7 +597,7 @@ async fn returns_as_soon_as_done_arrives() {
     })
     .await;
 
-    let model = OpenAIModel::new("test-key", &base_url, "test-model");
+    let model = OpenAIModel::new("test-key", &base_url, "test-model").unwrap();
     let completed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         stream_events(&model).await
     })
@@ -948,4 +948,34 @@ async fn does_not_send_the_argument_error_on_the_wire() {
 
     assert_eq!(message["tool_calls"][0]["function"]["arguments"], "{}");
     assert!(message["tool_calls"][0].get("arguments_error").is_none());
+}
+
+#[tokio::test]
+async fn gives_up_on_a_stalled_endpoint() {
+    // The server accepts the request and then says nothing. Without a read
+    // timeout the turn would wait forever.
+    let base_url = serve(|mut stream| async move {
+        // Hold the response open without sending anything: the request was
+        // accepted, so only a read timeout can end the wait.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let _ = stream.shutdown().await;
+    })
+    .await;
+
+    let model = OpenAIModel::with_timeouts(
+        "test-key",
+        &base_url,
+        "test-model",
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(200),
+    )
+    .unwrap();
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        model.complete_stream(&[], &[], &mut |_| {}).await
+    })
+    .await
+    .expect("the read timeout should have fired")
+    .expect_err("a silent endpoint is an error, not an empty reply");
+    assert!(format!("{error:#}").contains("timed out"), "{error:#}");
 }
