@@ -221,7 +221,11 @@ and fork bombs. It also looks through the wrappers that hide a command from a
 first reading: `$(...)`, backticks and `<( )` substitutions; `find`'s `-delete`
 and `-exec` family; and backslashes inside a program name (`r\m`). A pipe that
 feeds a shell or an interpreter with no script of its own (`curl … | sh`) is
-refused, because the code it runs never appears in the command line.
+refused, because the code it runs never appears in the command line. A
+redirection that would write outside the workspace (`> /etc/passwd`,
+`> ../../x`) is refused as well; `> /dev/null`, `2>&1` and a path inside the
+workspace are fine. The comparison is lexical, so a symlink inside the
+workspace that points outside it is not caught.
 
 It is a best-effort static check. It does **not** see: a command assembled from
 variables, a script stored on disk, an interpreter not on its list, nesting
