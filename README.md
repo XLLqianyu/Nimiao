@@ -217,8 +217,16 @@ not exist yet are still accepted for writes. Windows device paths (`\\.\`,
 separators, unwraps launchers such as `sudo`, `env`, and `xargs`, recurses into
 nested `bash -c` payloads, and blocks a short list of catastrophic operations:
 recursive deletes aimed at system roots, disk formatting, `dd` to a raw device,
-and fork bombs. It is a best-effort static check; it cannot see what a script
-does after it starts.
+and fork bombs. It also looks through the wrappers that hide a command from a
+first reading: `$(...)`, backticks and `<( )` substitutions; `find`'s `-delete`
+and `-exec` family; and backslashes inside a program name (`r\m`). A pipe that
+feeds a shell or an interpreter with no script of its own (`curl … | sh`) is
+refused, because the code it runs never appears in the command line.
+
+It is a best-effort static check. It does **not** see: a command assembled from
+variables, a script stored on disk, an interpreter not on its list, nesting
+deeper than 8 levels, shell aliases and functions, or anything an `ssh` session
+does on the far side. It cannot see what a script does after it starts.
 
 Shell commands run with stdin set to null and are killed as a process tree on
 timeout, so nothing is left holding the pipes.
