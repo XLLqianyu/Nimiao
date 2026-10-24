@@ -233,7 +233,11 @@ deeper than 8 levels, shell aliases and functions, or anything an `ssh` session
 does on the far side. It cannot see what a script does after it starts.
 
 Shell commands run with stdin set to null and are killed as a process tree on
-timeout, so nothing is left holding the pipes.
+timeout, so nothing is left holding the pipes. They also run without
+`OPENAI_API_KEY`, `OPENAI_BASE_URL`, or `OPENAI_MODEL_NAME` in their
+environment: the command is model-authored, so leaving the key in reach would
+turn one prompt injection into a leak. The rest of the environment, including
+`PATH` and `HOME`, is passed through so ordinary commands work.
 
 ## Development
 
