@@ -94,6 +94,11 @@ Do not weaken these in passing:
   against the workspace root by hand.
 - Every shell command goes through `execpolicy::check_command` before it
   reaches a shell.
+- Every `ToolCall` written to history is followed immediately by exactly one
+  `ToolResult`, in the order the calls were declared, and a turn that ends
+  early appends a closing assistant message. `engine/src/lib.rs` documents the
+  invariant; `engine/tests/agent.rs` checks it with
+  `assert_history_is_well_formed`.
 - Output limits live in `tools/src/truncate.rs` (2000 lines or 50 KB, whichever
   is hit first), the `bash` timeout bounds in `tools/src/bash.rs` (30 seconds
   by default, 600 at most), and the per-turn step cap in `engine/src/lib.rs`

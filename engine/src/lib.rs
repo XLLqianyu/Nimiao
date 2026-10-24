@@ -4,6 +4,16 @@
 //! appends the user message to the conversation, asks the model for the next
 //! step, runs whatever tools it asks for, and repeats until the model answers
 //! without further tool calls.
+//!
+//! # History shape
+//!
+//! History is kept in a shape a provider will accept back: every tool call an
+//! assistant step declares is followed immediately by exactly one result, in
+//! the order the calls were declared. A call that is never run — because the
+//! turn was cancelled, because the reply was truncated, or because its
+//! arguments did not parse — still gets a result saying so. A turn that ends
+//! without the model's closing message leaves one behind that explains why, so
+//! the next turn is never a user message answering a tool result.
 
 use model::{Model, ModelEvent, ModelResponse, StopReason};
 use protocol::{Item, ToolCall};
@@ -109,6 +119,7 @@ impl<M: Model> Agent<M> {
         }
 
         history.push(Item::UserMessage(input.into()));
+        let turn_start = history.len() - 1;
 
         let definitions = self.tools.definitions();
         // A non-streaming endpoint fails to stream on every tool round; say so
@@ -127,19 +138,37 @@ impl<M: Model> Agent<M> {
                     }
                 }
             };
+            let response = tokio::select! {
+                biased;
+                _ = &mut cancel => {
+                    close_open_batch(history, INTERRUPTED);
+                    return Ok(TurnOutcome::Interrupted);
+                }
+                response = self
+                    .model
+                    .complete_stream(history, &definitions, &mut sink) => response,
+            };
             let ModelResponse {
                 content,
                 tool_calls,
                 stop_reason,
-            } = tokio::select! {
-                biased;
-                _ = &mut cancel => return Ok(TurnOutcome::Interrupted),
-                response = self
-                    .model
-                    .complete_stream(history, &definitions, &mut sink) => response?,
+            } = match response {
+                Ok(response) => response,
+                // Nothing of this step reached history, so dropping the user
+                // message leaves the conversation exactly as it was: the
+                // caller can retry without pushing the same prompt twice.
+                Err(error) if history.len() == turn_start + 1 => {
+                    history.truncate(turn_start);
+                    return Err(error);
+                }
+                Err(error) => {
+                    close_unfinished_turn(history, "the model failed before answering", on_event);
+                    return Err(error);
+                }
             };
 
             if stop_reason == Some(StopReason::ContentFilter) {
+                note_stopped(history, CONTENT_FILTERED);
                 anyhow::bail!("Provider finish_reason: content_filter");
             }
 
@@ -150,13 +179,9 @@ impl<M: Model> Agent<M> {
             // so record every one as failed instead of running any.
             if stop_reason == Some(StopReason::Length) && !tool_calls.is_empty() {
                 for call in tool_calls {
-                    record_unexecuted(
-                        history,
-                        call,
-                        "the response hit the output token limit, so its arguments may be truncated",
-                        on_event,
-                    );
+                    record_unexecuted(history, call, TRUNCATED, on_event);
                 }
+                note_stopped(history, TRUNCATED);
                 anyhow::bail!("the reply was truncated before the tool calls were complete");
             }
 
@@ -168,6 +193,7 @@ impl<M: Model> Agent<M> {
 
             if tool_calls.is_empty() {
                 let Some(text) = text else {
+                    note_stopped(history, "the model returned an empty response");
                     anyhow::bail!("the model returned an empty response");
                 };
                 history.push(Item::AssistantMessage(text));
@@ -178,15 +204,39 @@ impl<M: Model> Agent<M> {
                 history.push(Item::AssistantMessage(text));
             }
 
-            for call in tool_calls {
-                tokio::select! {
+            // A batch is answered in full even when the turn is cancelled part
+            // way through it: the calls that did not run still need results.
+            let mut batch = tool_calls.into_iter();
+            while let Some(call) = batch.next() {
+                on_event(AgentEvent::ToolStarted {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                });
+                let executed = tokio::select! {
                     biased;
-                    _ = &mut cancel => return Ok(TurnOutcome::Interrupted),
-                    () = self.run_tool(history, call, on_event) => {}
-                }
+                    _ = &mut cancel => None,
+                    executed = self.invoke(&call) => Some(executed),
+                };
+                let Some((content, is_error)) = executed else {
+                    let content = not_executed(&call, CANCELLED);
+                    record_result(history, call, content, true, on_event);
+                    for call in batch {
+                        record_unexecuted(history, call, CANCELLED, on_event);
+                    }
+                    close_open_batch(history, INTERRUPTED);
+                    return Ok(TurnOutcome::Interrupted);
+                };
+                record_result(history, call, content, is_error, on_event);
             }
         }
 
+        close_unfinished_turn(
+            history,
+            &format!(
+                "the model called tools {MAX_STEPS_PER_TURN} times without finishing the turn"
+            ),
+            on_event,
+        );
         anyhow::bail!(
             "the model called tools {MAX_STEPS_PER_TURN} times without finishing the turn"
         )
@@ -201,80 +251,114 @@ impl<M: Model> Agent<M> {
         self.run_turn_stream(history, input, &mut |_| {}).await
     }
 
-    /// Executes one tool call and records the call together with its result.
-    async fn run_tool(
-        &self,
-        history: &mut Vec<Item>,
-        call: ToolCall,
-        on_event: &mut (dyn FnMut(AgentEvent) + Send),
-    ) {
-        let arguments = call.arguments.clone();
-        on_event(AgentEvent::ToolStarted {
-            name: call.name.clone(),
-            arguments: arguments.clone(),
-        });
+    /// Executes one tool call, returning what to record and whether it failed.
+    ///
+    /// Kept free of history so a cancelled call can still be recorded by the
+    /// caller: a future that writes history would be dropped mid-write.
+    async fn invoke(&self, call: &ToolCall) -> (String, bool) {
         // Malformed arguments never reach the tool: it would only fail on a
         // schema it cannot see. The text the model sent goes back to it
         // instead, so it can retry with something parseable.
-        let (content, is_error) = match call.arguments_error.as_deref() {
-            Some(error) => (
+        if let Some(error) = call.arguments_error.as_deref() {
+            return (
                 format!("Invalid arguments for tool \"{}\": {error}", call.name),
                 true,
-            ),
-            None => match self.tools.get(&call.name) {
-                Some(tool) => match tool.execute(arguments.clone(), &self.ctx).await {
-                    Ok(output) => (output.content, output.is_error),
-                    Err(err) => (format!("{err:#}"), true),
-                },
-                None => (format!("unknown tool '{}'", call.name), true),
+            );
+        }
+        match self.tools.get(&call.name) {
+            Some(tool) => match tool.execute(call.arguments.clone(), &self.ctx).await {
+                Ok(output) => (output.content, output.is_error),
+                Err(err) => (format!("{err:#}"), true),
             },
-        };
-
-        history.push(Item::ToolCall(call.clone()));
-        history.push(Item::ToolResult {
-            tool_call_id: call.id,
-            content: content.clone(),
-            is_error,
-        });
-        on_event(AgentEvent::ToolFinished {
-            name: call.name,
-            arguments,
-            content,
-            is_error,
-        });
+            None => (format!("unknown tool '{}'", call.name), true),
+        }
     }
+}
+
+/// Records a call together with its result, which is what keeps the history
+/// replayable: a declared call without one is rejected by providers.
+fn record_result(
+    history: &mut Vec<Item>,
+    call: ToolCall,
+    content: String,
+    is_error: bool,
+    on_event: &mut (dyn FnMut(AgentEvent) + Send),
+) {
+    history.push(Item::ToolCall(call.clone()));
+    history.push(Item::ToolResult {
+        tool_call_id: call.id,
+        content: content.clone(),
+        is_error,
+    });
+    on_event(AgentEvent::ToolFinished {
+        name: call.name,
+        arguments: call.arguments,
+        content,
+        is_error,
+    });
 }
 
 /// Records a call the model declared but that must not run, with a failure
 /// result explaining why.
-///
-/// The call still goes into history: a history in which a declared call has no
-/// result is rejected by providers, so the failure result is what keeps the
-/// transcript replayable.
 fn record_unexecuted(
     history: &mut Vec<Item>,
     call: ToolCall,
     reason: &str,
     on_event: &mut (dyn FnMut(AgentEvent) + Send),
 ) {
-    let content = format!(
-        "Tool call \"{}\" was not executed: {reason}. Re-issue the tool call with complete arguments.",
-        call.name
-    );
     on_event(AgentEvent::ToolStarted {
         name: call.name.clone(),
         arguments: call.arguments.clone(),
     });
-    history.push(Item::ToolCall(call.clone()));
-    history.push(Item::ToolResult {
-        tool_call_id: call.id.clone(),
-        content: content.clone(),
-        is_error: true,
-    });
-    on_event(AgentEvent::ToolFinished {
-        name: call.name,
-        arguments: call.arguments,
-        content,
-        is_error: true,
-    });
+    let content = not_executed(&call, reason);
+    record_result(history, call, content, true, on_event);
+}
+
+/// What the model is told about a call that did not run.
+fn not_executed(call: &ToolCall, reason: &str) -> String {
+    format!(
+        "Tool call \"{}\" was not executed: {reason}. Re-issue the tool call with complete arguments.",
+        call.name
+    )
+}
+
+/// The reason recorded for calls a cancelled turn did not run.
+const CANCELLED: &str = "the turn was cancelled";
+
+/// The reason recorded for calls in a reply the token limit cut short.
+const TRUNCATED: &str =
+    "the response hit the output token limit, so its arguments may be truncated";
+
+/// The reason recorded when a provider filtered the reply.
+const CONTENT_FILTERED: &str = "the provider filtered the reply";
+
+/// Said in place of the assistant turn that never arrived.
+const INTERRUPTED: &str = "The turn was interrupted before I finished answering.";
+
+/// Ends a turn that stopped without the model's closing message, so the next
+/// user message does not follow a tool result.
+fn close_unfinished_turn(
+    history: &mut Vec<Item>,
+    reason: &str,
+    on_event: &mut (dyn FnMut(AgentEvent) + Send),
+) {
+    on_event(AgentEvent::Notice(reason.to_string()));
+    note_stopped(history, reason);
+}
+
+/// Explains in history why a turn ended before the model finished, when the
+/// last thing said needs an answer.
+fn note_stopped(history: &mut Vec<Item>, reason: &str) {
+    close_open_batch(history, &format!("I stopped: {reason}."));
+}
+
+/// Appends an assistant message when history ends on a tool result.
+///
+/// Some providers reject a user message that follows a tool result without an
+/// assistant message between them. Nothing is added when the last item is
+/// already something else, so this is safe to call on every early return.
+fn close_open_batch(history: &mut Vec<Item>, text: &str) {
+    if matches!(history.last(), Some(Item::ToolResult { .. })) {
+        history.push(Item::AssistantMessage(text.to_string()));
+    }
 }
