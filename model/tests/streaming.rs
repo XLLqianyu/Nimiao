@@ -156,6 +156,168 @@ async fn stream_events(model: &OpenAIModel) -> (ModelResponse, Vec<ModelEvent>) 
     (response, events)
 }
 
+/// Sends one completion and returns the request body the client built.
+///
+/// The body is parsed rather than matched as text, so the assertions below see
+/// the message structure rather than how `serde_json` happened to space it.
+async fn sent_body(history: &[Item], tools: &[protocol::ToolDefinition]) -> serde_json::Value {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (sent, received) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        write_response(&mut stream, Reply::sse("data: [DONE]\n\n")).await;
+        let _ = sent.send(request);
+    });
+
+    let model = OpenAIModel::new("test-key", &base_url, "test-model");
+    model
+        .complete_stream(history, tools, &mut |_| {})
+        .await
+        .unwrap();
+
+    let request = received.await.unwrap();
+    let body = request
+        .split_once("\r\n\r\n")
+        .expect("the request must carry a body")
+        .1;
+    serde_json::from_str(body).expect("the request body must be JSON")
+}
+
+fn call(id: &str, name: &str, arguments: serde_json::Value) -> Item {
+    Item::ToolCall(protocol::ToolCall {
+        id: id.to_string(),
+        name: name.to_string(),
+        arguments,
+    })
+}
+
+#[tokio::test]
+async fn sends_text_and_a_call_as_one_assistant_message() {
+    let history = vec![
+        Item::UserMessage("hi".to_string()),
+        Item::AssistantMessage("running it. ".to_string()),
+        call("call_1", "bash", serde_json::json!({"command": "ls"})),
+        Item::ToolResult {
+            tool_call_id: "call_1".to_string(),
+            content: "a.txt".to_string(),
+            is_error: false,
+        },
+    ];
+
+    let body = sent_body(&history, &[]).await;
+    let messages = body["messages"].as_array().unwrap();
+
+    assert_eq!(messages.len(), 3, "{messages:#?}");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["content"], "running it. ");
+    let calls = messages[1]["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["id"], "call_1");
+    assert_eq!(calls[0]["type"], "function");
+    assert_eq!(calls[0]["function"]["name"], "bash");
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[2]["tool_call_id"], "call_1");
+}
+
+#[tokio::test]
+async fn sends_parallel_calls_in_one_assistant_message() {
+    let history = vec![
+        Item::UserMessage("hi".to_string()),
+        call("call_a", "read_file", serde_json::json!({"path": "a"})),
+        call("call_b", "read_file", serde_json::json!({"path": "b"})),
+        Item::ToolResult {
+            tool_call_id: "call_a".to_string(),
+            content: "a".to_string(),
+            is_error: false,
+        },
+        Item::ToolResult {
+            tool_call_id: "call_b".to_string(),
+            content: "b".to_string(),
+            is_error: false,
+        },
+    ];
+
+    let body = sent_body(&history, &[]).await;
+    let messages = body["messages"].as_array().unwrap();
+
+    assert_eq!(messages.len(), 4, "{messages:#?}");
+    let assistants: Vec<_> = messages
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .collect();
+    assert_eq!(assistants.len(), 1, "{messages:#?}");
+    assert!(assistants[0]["content"].is_null(), "{messages:#?}");
+    let calls = assistants[0]["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["id"], "call_a");
+    assert_eq!(calls[1]["id"], "call_b");
+}
+
+#[tokio::test]
+async fn keeps_text_with_parallel_calls_in_the_same_message() {
+    let history = vec![
+        Item::UserMessage("hi".to_string()),
+        Item::AssistantMessage("looking. ".to_string()),
+        call("call_a", "bash", serde_json::json!({"command": "one"})),
+        call("call_b", "bash", serde_json::json!({"command": "two"})),
+    ];
+
+    let body = sent_body(&history, &[]).await;
+    let messages = body["messages"].as_array().unwrap();
+
+    assert_eq!(messages.len(), 2, "{messages:#?}");
+    assert_eq!(messages[1]["content"], "looking. ");
+    assert_eq!(messages[1]["tool_calls"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn keeps_an_empty_call_id_empty() {
+    let history = vec![
+        Item::UserMessage("hi".to_string()),
+        call("", "bash", serde_json::json!({"command": "ls"})),
+    ];
+
+    let body = sent_body(&history, &[]).await;
+    let messages = body["messages"].as_array().unwrap();
+
+    // Fabricating an id would break the `tool_call_id` that answers it.
+    assert_eq!(messages[1]["tool_calls"][0]["id"], "");
+}
+
+#[tokio::test]
+async fn drops_an_assistant_message_with_nothing_in_it() {
+    let history = vec![
+        Item::UserMessage("hi".to_string()),
+        Item::AssistantMessage("   ".to_string()),
+        Item::AssistantMessage("ok".to_string()),
+    ];
+
+    let body = sent_body(&history, &[]).await;
+    let messages = body["messages"].as_array().unwrap();
+
+    assert_eq!(messages.len(), 2, "{messages:#?}");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["content"], "ok");
+    assert!(messages[1].get("tool_calls").is_none());
+}
+
+#[tokio::test]
+async fn sends_tools_beside_the_messages() {
+    let tools = vec![protocol::ToolDefinition {
+        name: "bash".to_string(),
+        description: "run a shell command".to_string(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
+
+    let body = sent_body(&[Item::UserMessage("hi".to_string())], &tools).await;
+
+    assert_eq!(body["tools"][0]["function"]["name"], "bash");
+    assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn streams_text_deltas() {
     let (model, served) = model_replying(vec![Reply::sse(

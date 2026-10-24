@@ -94,6 +94,19 @@ Conversation state lives in one `Vec<Item>`. Every user message, assistant
 reply, tool call, and tool result is appended to it, so each turn sees
 everything before it.
 
+That flat list is regrouped into the wire format on every request:
+
+| History | Wire message |
+| --- | --- |
+| `UserMessage` | one `user` message |
+| `AssistantMessage` followed by the `ToolCall`s of the same step | **one** `assistant` message carrying the text as `content` and every call in `tool_calls` |
+| `ToolResult` | one `tool` message with the matching `tool_call_id` |
+
+Providers reject a step split across several `assistant` messages, so the
+grouping is not cosmetic. An `assistant` message with neither text nor calls is
+skipped rather than sent empty, and a call that arrives with no text produces
+`content: null`.
+
 ## Streaming
 
 Each step is requested with `stream: true` and read as server-sent events. Prose

@@ -29,6 +29,55 @@ enum StreamOutcome {
     NotSse(Vec<u8>),
 }
 
+/// One assistant step being collected: its text so far and every call it
+/// declared, in the order the model produced them.
+#[derive(Default)]
+struct AssistantStep {
+    text: String,
+    calls: Vec<serde_json::Value>,
+}
+
+impl AssistantStep {
+    fn push_text(&mut self, text: &str) {
+        self.text.push_str(text);
+    }
+
+    fn push_call(&mut self, call: &ToolCall) {
+        self.calls.push(json!({
+            "id": call.id,
+            "type": "function",
+            "function": {
+                "name": call.name,
+                "arguments": call.arguments.to_string()
+            }
+        }));
+    }
+}
+
+/// Writes the pending step, if any, and clears it.
+///
+/// A step with neither text nor calls is skipped: several providers refuse an
+/// `assistant` message that carries neither, and there is nothing to say in it.
+fn flush_step(messages: &mut Vec<serde_json::Value>, open: &mut Option<AssistantStep>) {
+    let Some(step) = open.take() else {
+        return;
+    };
+    let content = if step.text.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(step.text)
+    };
+    if content.is_null() && step.calls.is_empty() {
+        return;
+    }
+
+    let mut message = json!({"role": "assistant", "content": content});
+    if !step.calls.is_empty() {
+        message["tool_calls"] = serde_json::Value::Array(step.calls);
+    }
+    messages.push(message);
+}
+
 impl OpenAIModel {
     pub fn new(api_key: &str, base_url: &str, model_name: &str) -> Self {
         Self {
@@ -39,33 +88,41 @@ impl OpenAIModel {
         }
     }
 
+    /// Maps the flat history onto the wire, one `assistant` message per step.
+    ///
+    /// A step's text and every tool call it declared belong to a single
+    /// `assistant` message: providers reject a call whose assistant message
+    /// carries a different set of calls, and the ones that are strict reject an
+    /// `assistant` message with neither content nor calls.
     fn format_messages(history: &[Item]) -> Vec<serde_json::Value> {
         let mut messages = vec![];
+        let mut open: Option<AssistantStep> = None;
+
         for item in history {
             match item {
-                Item::UserMessage(t) => messages.push(json!({"role": "user", "content": t})),
-                Item::AssistantMessage(t) => {
-                    messages.push(json!({"role": "assistant", "content": t}))
+                Item::UserMessage(text) => {
+                    flush_step(&mut messages, &mut open);
+                    messages.push(json!({"role": "user", "content": text}));
                 }
-                Item::ToolCall(c) => {
-                    messages.push(json!({
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": c.id,
-                            "type": "function",
-                            "function": {
-                                "name": c.name,
-                                "arguments": c.arguments.to_string()
-                            }
-                        }]
-                    }));
+                Item::AssistantMessage(text) => {
+                    // A step with no text still gets its message once a call
+                    // arrives; an empty one on its own is dropped by the flush.
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    open.get_or_insert_with(AssistantStep::default)
+                        .push_text(text);
+                }
+                Item::ToolCall(call) => {
+                    open.get_or_insert_with(AssistantStep::default)
+                        .push_call(call);
                 }
                 Item::ToolResult {
                     tool_call_id,
                     content,
                     ..
                 } => {
+                    flush_step(&mut messages, &mut open);
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": tool_call_id,
@@ -74,6 +131,8 @@ impl OpenAIModel {
                 }
             }
         }
+
+        flush_step(&mut messages, &mut open);
         messages
     }
 
