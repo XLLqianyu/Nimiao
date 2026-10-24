@@ -2,10 +2,10 @@
 
 use async_trait::async_trait;
 use engine::{Agent, AgentEvent, TurnOutcome};
-use model::{Model, ModelEvent, ModelResponse};
+use model::{Model, ModelEvent, ModelResponse, StopReason};
 use protocol::{Item, ToolCall, ToolDefinition};
 use serde_json::json;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tools::{Tool, ToolContext, ToolOutput, ToolRegistry};
 
@@ -98,6 +98,39 @@ fn agent_with_model<M: Model>(model: M) -> Agent<M> {
     Agent::new(model, registry, ctx)
 }
 
+/// Checks the history invariant: every tool call the model declared is
+/// answered by exactly one result, in the order the calls were declared, with
+/// nothing else said in between.
+///
+/// Self-contained so the same check can move into the session layer.
+fn assert_history_is_well_formed(history: &[Item]) {
+    let mut unanswered: Vec<String> = vec![];
+    for (index, item) in history.iter().enumerate() {
+        match item {
+            Item::ToolCall(call) => unanswered.push(call.id.clone()),
+            Item::ToolResult { tool_call_id, .. } => {
+                let Some(want) = unanswered.first() else {
+                    panic!("item {index}: result for {tool_call_id} answers no call");
+                };
+                assert_eq!(
+                    tool_call_id, want,
+                    "item {index}: results must answer calls in the order declared"
+                );
+                unanswered.remove(0);
+            }
+            _ => assert!(
+                unanswered.is_empty(),
+                "item {index}: {} call(s) left unanswered: {unanswered:?}",
+                unanswered.len()
+            ),
+        }
+    }
+    assert!(
+        unanswered.is_empty(),
+        "calls left unanswered: {unanswered:?}"
+    );
+}
+
 fn tool_response(text: Option<&str>, command: &str) -> ModelResponse {
     ModelResponse {
         content: text.map(str::to_string),
@@ -105,7 +138,9 @@ fn tool_response(text: Option<&str>, command: &str) -> ModelResponse {
             id: "call_1".to_string(),
             name: "echo".to_string(),
             arguments: json!({"command": command}),
+            arguments_error: None,
         }],
+        stop_reason: Some(StopReason::ToolCalls),
     }
 }
 
@@ -116,6 +151,7 @@ async fn reports_text_then_tools_then_text() {
         ModelResponse {
             content: Some("done.".to_string()),
             tool_calls: vec![],
+            stop_reason: None,
         },
     ]);
     let agent = agent(model);
@@ -162,6 +198,7 @@ async fn announces_a_fallback_only_once_per_turn() {
             ModelResponse {
                 content: Some("done.".to_string()),
                 tool_calls: vec![],
+                stop_reason: None,
             },
         ]),
         falls_back: true,
@@ -187,6 +224,7 @@ async fn run_turn_works_without_a_sink() {
     let model = ScriptedModel::new(vec![ModelResponse {
         content: Some("hi".to_string()),
         tool_calls: vec![],
+        stop_reason: None,
     }]);
     let agent = agent(model);
     let mut history = vec![];
@@ -201,6 +239,7 @@ async fn rejects_an_empty_reply() {
     let model = ScriptedModel::new(vec![ModelResponse {
         content: Some("   ".to_string()),
         tool_calls: vec![],
+        stop_reason: None,
     }]);
     let agent = agent(model);
     let mut history = vec![];
@@ -229,6 +268,165 @@ async fn stops_at_the_step_limit() {
 
     assert_eq!(started, 32);
     assert!(format!("{error:#}").contains("32"), "{error:#}");
+    // The turn stopped mid-way, so the last thing said is a tool result. The
+    // closing message explains it and keeps the next prompt well-formed.
+    assert!(matches!(history.last(), Some(Item::AssistantMessage(_))));
+    assert_history_is_well_formed(&history);
+}
+
+#[tokio::test]
+async fn does_not_run_tool_calls_from_a_truncated_reply() {
+    let mut step = tool_response(None, "ls");
+    step.stop_reason = Some(StopReason::Length);
+    let model = ScriptedModel::new(vec![step]);
+    let agent = agent(model);
+    let mut history = vec![];
+    let mut finished = vec![];
+
+    let error = agent
+        .run_turn_stream(&mut history, "go", &mut |event| {
+            if let AgentEvent::ToolFinished {
+                name,
+                content,
+                is_error,
+                ..
+            } = event
+            {
+                finished.push((name, content, is_error));
+            }
+        })
+        .await
+        .unwrap_err();
+
+    assert!(format!("{error:#}").contains("truncated"), "{error:#}");
+    assert_eq!(finished.len(), 1, "{finished:?}");
+    let (name, content, is_error) = &finished[0];
+    assert_eq!(name, "echo");
+    assert!(is_error);
+    assert!(content.contains("output token limit"), "{content}");
+    // The call is still recorded, with a failure result: dropping it would
+    // leave the assistant message unanswered. A closing assistant message then
+    // keeps the next user message from following a tool result.
+    assert_eq!(history.len(), 4, "{history:?}");
+    assert!(matches!(history[1], Item::ToolCall(_)));
+    assert!(matches!(
+        history[2],
+        Item::ToolResult { is_error: true, .. }
+    ));
+    assert!(matches!(history[3], Item::AssistantMessage(_)));
+    assert_history_is_well_formed(&history);
+}
+
+#[tokio::test]
+async fn reports_a_content_filtered_reply_as_an_error() {
+    let model = ScriptedModel::new(vec![ModelResponse {
+        content: None,
+        tool_calls: vec![],
+        stop_reason: Some(StopReason::ContentFilter),
+    }]);
+    let agent = agent(model);
+    let mut history = vec![];
+
+    let error = agent
+        .run_turn_stream(&mut history, "go", &mut |_| {})
+        .await
+        .unwrap_err();
+
+    assert!(format!("{error:#}").contains("content_filter"), "{error:#}");
+}
+
+#[tokio::test]
+async fn notices_a_reply_cut_short_without_tool_calls() {
+    let model = ScriptedModel::new(vec![ModelResponse {
+        content: Some("a long answer".to_string()),
+        tool_calls: vec![],
+        stop_reason: Some(StopReason::Length),
+    }]);
+    let agent = agent(model);
+    let mut history = vec![];
+    let mut events = vec![];
+
+    agent
+        .run_turn_stream(&mut history, "go", &mut |event| events.push(event))
+        .await
+        .unwrap();
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Notice(message) if message.contains("output token limit")
+    )));
+    assert!(matches!(history.last(), Some(Item::AssistantMessage(_))));
+}
+
+#[tokio::test]
+async fn does_not_run_a_call_whose_arguments_did_not_parse() {
+    struct RecordingTool {
+        ran: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    #[async_trait]
+    impl Tool for RecordingTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name().to_string(),
+                description: "records every execution".to_string(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> anyhow::Result<ToolOutput> {
+            self.ran.lock().unwrap().push(args);
+            Ok(ToolOutput::success("ran"))
+        }
+    }
+
+    let ran = Arc::new(Mutex::new(vec![]));
+    let mut malformed = ToolCall::new("call_1", "echo", json!({}));
+    malformed.arguments_error = Some("expected value\n\nReceived arguments:\n{oops".to_string());
+    let model = ScriptedModel::new(vec![
+        ModelResponse {
+            content: None,
+            tool_calls: vec![malformed],
+            stop_reason: None,
+        },
+        ModelResponse {
+            content: Some("retrying".to_string()),
+            tool_calls: vec![],
+            stop_reason: None,
+        },
+    ]);
+    let ctx = ToolContext::new(sandbox::Sandbox::current().unwrap());
+    let agent = Agent::new(
+        model,
+        ToolRegistry::new(vec![Box::new(RecordingTool {
+            ran: Arc::clone(&ran),
+        })]),
+        ctx,
+    );
+    let mut history = vec![];
+
+    agent.run_turn(&mut history, "go").await.unwrap();
+
+    assert!(ran.lock().unwrap().is_empty(), "the tool must not run");
+    match &history[2] {
+        Item::ToolResult {
+            content, is_error, ..
+        } => {
+            assert!(is_error);
+            assert!(content.contains("Invalid arguments for tool \"echo\""));
+            // The text the model sent comes back to it, not an empty object.
+            assert!(content.contains("{oops"), "{content}");
+        }
+        other => panic!("expected a tool result, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -240,11 +438,14 @@ async fn records_an_unknown_tool_as_an_error_result() {
                 id: "call_1".to_string(),
                 name: "missing".to_string(),
                 arguments: json!({}),
+                arguments_error: None,
             }],
+            stop_reason: None,
         },
         ModelResponse {
             content: Some("done".to_string()),
             tool_calls: vec![],
+            stop_reason: None,
         },
     ]);
     let agent = agent(model);
@@ -316,11 +517,14 @@ async fn records_a_failing_tool_as_an_error_result() {
                 id: "call_1".to_string(),
                 name: "fail".to_string(),
                 arguments: json!({}),
+                arguments_error: None,
             }],
+            stop_reason: None,
         },
         ModelResponse {
             content: Some("done".to_string()),
             tool_calls: vec![],
+            stop_reason: None,
         },
     ]);
     let ctx = ToolContext::new(sandbox::Sandbox::current().unwrap());
@@ -446,7 +650,7 @@ async fn cancellation_while_streaming_keeps_partial_text_out_of_history() {
 }
 
 #[tokio::test]
-async fn cancellation_during_a_tool_leaves_no_tool_items_in_history() {
+async fn cancellation_during_a_tool_records_a_failed_result() {
     struct HangingTool {
         cancel: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     }
@@ -508,31 +712,170 @@ async fn cancellation_during_a_tool_leaves_no_tool_items_in_history() {
     .unwrap();
 
     assert_eq!(outcome, TurnOutcome::Interrupted);
+    // The model declared the call, so it must be answered even though it never
+    // ran: a call without a result is rejected by providers on the next turn.
     assert_eq!(
         events,
-        [AgentEvent::ToolStarted {
-            name: "echo".to_string(),
-            arguments: json!({"command": "work"}),
-        }]
+        [
+            AgentEvent::ToolStarted {
+                name: "echo".to_string(),
+                arguments: json!({"command": "work"}),
+            },
+            AgentEvent::ToolFinished {
+                name: "echo".to_string(),
+                arguments: json!({"command": "work"}),
+                content: "Tool call \"echo\" was not executed: the turn was cancelled. \
+                          Re-issue the tool call with complete arguments."
+                    .to_string(),
+                is_error: true,
+            },
+        ]
     );
-    assert_eq!(history.len(), 1);
+    assert_eq!(history.len(), 4, "{history:?}");
     assert!(matches!(history[0], Item::UserMessage(_)));
+    match &history[2] {
+        Item::ToolResult {
+            content, is_error, ..
+        } => {
+            assert!(is_error);
+            assert!(content.contains("cancelled"), "{content}");
+        }
+        other => panic!("expected a tool result, got {other:?}"),
+    }
+    assert_history_is_well_formed(&history);
 }
 
 #[tokio::test]
-async fn propagates_a_model_error_and_keeps_the_user_message() {
-    let model = ScriptedModel::new(vec![]);
-    let agent = agent(model);
+async fn cancellation_mid_batch_answers_every_call() {
+    struct OneHangingTool {
+        cancel: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        ran: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Tool for OneHangingTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name().to_string(),
+                description: "hangs on the first call".to_string(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> anyhow::Result<ToolOutput> {
+            let command = args["command"].as_str().unwrap_or_default().to_string();
+            self.ran.lock().unwrap().push(command.clone());
+            if command == "hang" {
+                if let Some(sender) = self.cancel.lock().unwrap().take() {
+                    let _ = sender.send(());
+                }
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            }
+            Ok(ToolOutput::success(command))
+        }
+    }
+
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let ran = Arc::new(Mutex::new(vec![]));
+    let model = ScriptedModel::new(vec![ModelResponse {
+        content: None,
+        tool_calls: vec![
+            ToolCall::new("call_1", "echo", json!({"command": "hang"})),
+            ToolCall::new("call_2", "echo", json!({"command": "never"})),
+        ],
+        stop_reason: Some(StopReason::ToolCalls),
+    }]);
+    let ctx = ToolContext::new(sandbox::Sandbox::current().unwrap());
+    let agent = Agent::new(
+        model,
+        ToolRegistry::new(vec![Box::new(OneHangingTool {
+            cancel: Mutex::new(Some(cancel_tx)),
+            ran: Arc::clone(&ran),
+        })]),
+        ctx,
+    );
     let mut history = vec![];
 
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        agent.run_turn_stream_cancellable(&mut history, "go", &mut |_| {}, async move {
+            let _ = cancel_rx.await;
+        }),
+    )
+    .await
+    .expect("mid-batch cancellation completed the turn")
+    .unwrap();
+
+    assert_eq!(outcome, TurnOutcome::Interrupted);
+    assert_eq!(
+        *ran.lock().unwrap(),
+        ["hang"],
+        "the second call must not run"
+    );
+    assert_history_is_well_formed(&history);
+    // Both calls are answered, and a closing message finishes the turn.
+    assert_eq!(history.len(), 6, "{history:?}");
+    match &history[5] {
+        Item::AssistantMessage(text) => assert!(text.contains("interrupted"), "{text}"),
+        other => panic!("expected a closing assistant message, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_failed_model_call_leaves_history_retryable() {
+    let agent = agent(ScriptedModel::new(vec![]));
+    let mut history = vec![];
+    let mut events = vec![];
+
     let error = agent
-        .run_turn_stream(&mut history, "go", &mut |_| {})
+        .run_turn_stream(&mut history, "go", &mut |event| events.push(event))
         .await
         .unwrap_err();
 
     assert!(format!("{error:#}").contains("script"), "{error:#}");
-    assert!(matches!(history[0], Item::UserMessage(_)));
-    assert_eq!(history.len(), 1);
+    // Nothing was written, so retrying the same prompt must not duplicate it.
+    assert!(history.is_empty(), "{history:?}");
+    assert_history_is_well_formed(&history);
+}
+
+#[tokio::test]
+async fn a_failure_after_a_tool_round_closes_the_turn() {
+    let model = ScriptedModel::new(vec![tool_response(None, "ls")]);
+    let agent = agent(model);
+    let mut history = vec![];
+    let mut notices = vec![];
+
+    let error = agent
+        .run_turn_stream(&mut history, "go", &mut |event| {
+            if let AgentEvent::Notice(message) = event {
+                notices.push(message);
+            }
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("no further steps"),
+        "{error:#}"
+    );
+    assert_history_is_well_formed(&history);
+    // The turn stopped on a tool result, so the history needs a closing
+    // message before the next user prompt.
+    assert!(matches!(history.last(), Some(Item::AssistantMessage(_))));
+    assert!(
+        notices.iter().any(|notice| notice.contains("model failed")),
+        "{notices:?}"
+    );
 }
 
 #[tokio::test]
@@ -542,6 +885,7 @@ async fn records_text_that_arrives_with_tool_calls() {
         ModelResponse {
             content: Some("done.".to_string()),
             tool_calls: vec![],
+            stop_reason: None,
         },
     ]);
     let agent = agent(model);
@@ -565,17 +909,21 @@ async fn runs_several_tool_calls_in_one_round() {
                     id: "call_1".to_string(),
                     name: "echo".to_string(),
                     arguments: json!({"command": "one"}),
+                    arguments_error: None,
                 },
                 ToolCall {
                     id: "call_2".to_string(),
                     name: "echo".to_string(),
                     arguments: json!({"command": "two"}),
+                    arguments_error: None,
                 },
             ],
+            stop_reason: None,
         },
         ModelResponse {
             content: Some("done".to_string()),
             tool_calls: vec![],
+            stop_reason: None,
         },
     ]);
     let agent = agent(model);
@@ -599,4 +947,5 @@ async fn runs_several_tool_calls_in_one_round() {
         ]
     );
     assert_eq!(history.len(), 6);
+    assert_history_is_well_formed(&history);
 }

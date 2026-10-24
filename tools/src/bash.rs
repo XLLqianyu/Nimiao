@@ -36,6 +36,12 @@ const KILL_GRACE: Duration = Duration::from_secs(5);
 /// Read chunk size.
 const READ_CHUNK: usize = 16 * 1024;
 
+/// Variables the model's own configuration lives in.
+///
+/// They are removed from every shell it starts: the command is model-authored,
+/// so leaving the API key in reach turns one prompt injection into a leak.
+const SECRET_ENVIRONMENT: [&str; 3] = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL_NAME"];
+
 /// Raw output retained while streaming. The snapshot only ever needs
 /// `DEFAULT_MAX_BYTES`, so keeping a few times that allows accurate line
 /// boundaries without unbounded growth.
@@ -118,7 +124,9 @@ impl Tool for BashTool {
             }
         };
 
-        execpolicy::check_command(&args.command)?;
+        // The workspace root lets the screening refuse a redirection that
+        // would write outside it, such as `> /etc/passwd`.
+        execpolicy::check_command_in(&args.command, Some(ctx.workspace_root()))?;
 
         let shell = resolve_shell()
             .context("No bash executable found. Install Git for Windows or put bash on PATH")?;
@@ -132,6 +140,12 @@ impl Tool for BashTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // The model configures this process, and a prompt injection only has
+        // to ask it to curl the value out. Clearing the whole environment
+        // would also drop PATH and HOME, which ordinary commands need.
+        for name in SECRET_ENVIRONMENT {
+            command.env_remove(name);
+        }
 
         let mut child = command
             .spawn()
@@ -525,4 +539,53 @@ fn path_candidates(executable: &str) -> Vec<PathBuf> {
         .into_iter()
         .map(|directory| directory.join(executable))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shell reads the variable, so the check has to go through a real
+    /// process. `env_remove` is applied to the child only, so setting the
+    /// variable here does not leak into other tests running in parallel.
+    #[tokio::test]
+    async fn the_api_key_is_not_visible_to_the_shell() {
+        // The guard restores the variable even if the assertion panics.
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("OPENAI_API_KEY", value),
+                    None => std::env::remove_var("OPENAI_API_KEY"),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("OPENAI_API_KEY"));
+        std::env::set_var("OPENAI_API_KEY", "sk-should-not-leak");
+
+        let root = std::env::temp_dir().join(format!(
+            "nimiao-bash-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = ToolContext::new(sandbox::Sandbox::new(&root).unwrap());
+
+        let output = BashTool
+            .execute(
+                serde_json::json!({"command": "echo \"${OPENAI_API_KEY:-unset}\""}),
+                &ctx,
+            )
+            .await;
+
+        let _ = std::fs::remove_dir_all(&root);
+        let Ok(output) = output else {
+            // No bash on this machine.
+            return;
+        };
+        assert_eq!(output.content.trim(), "unset");
+    }
 }

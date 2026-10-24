@@ -67,7 +67,13 @@ async fn main() -> ExitCode {
     let ctx = ToolContext::new(sandbox);
     let root = ctx.workspace_root().to_path_buf();
     let registry = default_registry();
-    let model = OpenAIModel::new(&api_key, &base_url, &model_name);
+    let model = match OpenAIModel::new(&api_key, &base_url, &model_name) {
+        Ok(model) => model,
+        Err(error) => {
+            eprintln!("{ERROR_PREFIX}cannot reach the model: {error:#}");
+            return ExitCode::FAILURE;
+        }
+    };
     let agent = Agent::new(model, registry, ctx);
 
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();

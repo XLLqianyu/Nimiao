@@ -1,15 +1,30 @@
 use crate::sse::SseDecoder;
-use crate::{Model, ModelEvent, ModelResponse, ToolDefinition};
+use crate::{Model, ModelEvent, ModelResponse, StopReason, ToolDefinition};
 use anyhow::Context;
 use async_trait::async_trait;
 use protocol::{Item, ToolCall};
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 /// Upper bound on bytes held while checking whether a claimed stream is one.
 /// A whole JSON completion is well below this.
 const MAX_SNIFF_BYTES: usize = 8 * 1024 * 1024;
+
+/// How long establishing the connection may take.
+///
+/// A provider that never accepts the socket would otherwise hold the turn
+/// forever; a DNS or TLS handshake that takes longer than this is not going to
+/// finish.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a single read may take once the connection is open.
+///
+/// This is a per-read bound, not a total one: a stream that keeps producing
+/// frames can run as long as it needs, while a connection that goes silent
+/// fails instead of hanging the turn.
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct OpenAIModel {
     client: reqwest::Client,
@@ -29,43 +44,125 @@ enum StreamOutcome {
     NotSse(Vec<u8>),
 }
 
+/// One assistant step being collected: its text so far and every call it
+/// declared, in the order the model produced them.
+#[derive(Default)]
+struct AssistantStep {
+    text: String,
+    calls: Vec<serde_json::Value>,
+}
+
+impl AssistantStep {
+    fn push_text(&mut self, text: &str) {
+        self.text.push_str(text);
+    }
+
+    fn push_call(&mut self, call: &ToolCall) {
+        self.calls.push(json!({
+            "id": call.id,
+            "type": "function",
+            "function": {
+                "name": call.name,
+                "arguments": call.arguments.to_string()
+            }
+        }));
+    }
+}
+
+/// Writes the pending step, if any, and clears it.
+///
+/// A step with neither text nor calls is skipped: several providers refuse an
+/// `assistant` message that carries neither, and there is nothing to say in it.
+fn flush_step(messages: &mut Vec<serde_json::Value>, open: &mut Option<AssistantStep>) {
+    let Some(step) = open.take() else {
+        return;
+    };
+    let content = if step.text.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(step.text)
+    };
+    if content.is_null() && step.calls.is_empty() {
+        return;
+    }
+
+    let mut message = json!({"role": "assistant", "content": content});
+    if !step.calls.is_empty() {
+        message["tool_calls"] = serde_json::Value::Array(step.calls);
+    }
+    messages.push(message);
+}
+
 impl OpenAIModel {
-    pub fn new(api_key: &str, base_url: &str, model_name: &str) -> Self {
-        Self {
-            client: reqwest::Client::new(),
+    /// Builds a model for an OpenAI-compatible endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Fails only if the HTTP client cannot be built, which in practice means
+    /// the TLS backend failed to initialise.
+    pub fn new(api_key: &str, base_url: &str, model_name: &str) -> anyhow::Result<Self> {
+        Self::with_timeouts(api_key, base_url, model_name, CONNECT_TIMEOUT, READ_TIMEOUT)
+    }
+
+    /// Builds a model with explicit connection and read timeouts.
+    ///
+    /// Tests use this to prove a stalled endpoint fails quickly rather than
+    /// waiting out the production bounds.
+    pub fn with_timeouts(
+        api_key: &str,
+        base_url: &str,
+        model_name: &str,
+        connect: Duration,
+        read: Duration,
+    ) -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(connect)
+            .read_timeout(read)
+            .build()
+            .context("failed to build the HTTP client")?;
+        Ok(Self {
+            client,
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
             model_name: model_name.to_string(),
-        }
+        })
     }
 
+    /// Maps the flat history onto the wire, one `assistant` message per step.
+    ///
+    /// A step's text and every tool call it declared belong to a single
+    /// `assistant` message: providers reject a call whose assistant message
+    /// carries a different set of calls, and the ones that are strict reject an
+    /// `assistant` message with neither content nor calls.
     fn format_messages(history: &[Item]) -> Vec<serde_json::Value> {
         let mut messages = vec![];
+        let mut open: Option<AssistantStep> = None;
+
         for item in history {
             match item {
-                Item::UserMessage(t) => messages.push(json!({"role": "user", "content": t})),
-                Item::AssistantMessage(t) => {
-                    messages.push(json!({"role": "assistant", "content": t}))
+                Item::UserMessage(text) => {
+                    flush_step(&mut messages, &mut open);
+                    messages.push(json!({"role": "user", "content": text}));
                 }
-                Item::ToolCall(c) => {
-                    messages.push(json!({
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": c.id,
-                            "type": "function",
-                            "function": {
-                                "name": c.name,
-                                "arguments": c.arguments.to_string()
-                            }
-                        }]
-                    }));
+                Item::AssistantMessage(text) => {
+                    // A step with no text still gets its message once a call
+                    // arrives; an empty one on its own is dropped by the flush.
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    open.get_or_insert_with(AssistantStep::default)
+                        .push_text(text);
+                }
+                Item::ToolCall(call) => {
+                    open.get_or_insert_with(AssistantStep::default)
+                        .push_call(call);
                 }
                 Item::ToolResult {
                     tool_call_id,
                     content,
                     ..
                 } => {
+                    flush_step(&mut messages, &mut open);
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": tool_call_id,
@@ -74,6 +171,8 @@ impl OpenAIModel {
                 }
             }
         }
+
+        flush_step(&mut messages, &mut open);
         messages
     }
 
@@ -123,16 +222,16 @@ impl OpenAIModel {
 
         if let Some(tcs) = message["tool_calls"].as_array() {
             for tc in tcs {
+                let (arguments, arguments_error) =
+                    parse_arguments(tc["function"]["arguments"].as_str());
                 tool_calls.push(ToolCall {
                     id: tc["id"].as_str().unwrap_or_default().to_string(),
                     name: tc["function"]["name"]
                         .as_str()
                         .unwrap_or_default()
                         .to_string(),
-                    arguments: serde_json::from_str(
-                        tc["function"]["arguments"].as_str().unwrap_or("{}"),
-                    )
-                    .unwrap_or(json!({})),
+                    arguments,
+                    arguments_error,
                 });
             }
         }
@@ -140,6 +239,7 @@ impl OpenAIModel {
         Ok(ModelResponse {
             content,
             tool_calls,
+            stop_reason: map_stop_reason(&choice["finish_reason"]),
         })
     }
 
@@ -328,6 +428,8 @@ struct StreamState {
     raw: Vec<u8>,
     text: String,
     calls: ToolCallAccumulator,
+    /// The last `finish_reason` seen, kept across frames.
+    stop_reason: Option<StopReason>,
 }
 
 impl StreamState {
@@ -337,6 +439,7 @@ impl StreamState {
             raw: Vec::new(),
             text: String::new(),
             calls: ToolCallAccumulator::default(),
+            stop_reason: None,
         }
     }
 
@@ -391,6 +494,9 @@ impl StreamState {
                 self.calls.push(call);
             }
         }
+        // A finish reason may arrive on any frame of a stream, usually the
+        // last one, so the latest value wins.
+        self.stop_reason = map_stop_reason(&choice["finish_reason"]).or(self.stop_reason.take());
     }
 
     fn finish(self) -> ModelResponse {
@@ -402,7 +508,23 @@ impl StreamState {
         ModelResponse {
             content,
             tool_calls: self.calls.finish(),
+            stop_reason: self.stop_reason,
         }
+    }
+}
+
+/// Maps a provider `finish_reason` onto a [`StopReason`].
+///
+/// `null`, a missing field, and an unknown string are all reported as `None`
+/// or `Other`: this client must still work against proxies that do not report
+/// a reason the way OpenAI does.
+fn map_stop_reason(reason: &Value) -> Option<StopReason> {
+    match reason.as_str()? {
+        "stop" | "end" => Some(StopReason::Stop),
+        "length" => Some(StopReason::Length),
+        "tool_calls" | "function_call" => Some(StopReason::ToolCalls),
+        "content_filter" => Some(StopReason::ContentFilter),
+        other => Some(StopReason::Other(other.to_string())),
     }
 }
 
@@ -460,12 +582,49 @@ impl ToolCallAccumulator {
     fn finish(self) -> Vec<ToolCall> {
         self.calls
             .into_values()
-            .map(|call| ToolCall {
-                id: call.id,
-                name: call.name,
-                arguments: serde_json::from_str(&call.arguments).unwrap_or(json!({})),
+            .map(|call| {
+                let (arguments, arguments_error) = parse_arguments(Some(&call.arguments));
+                ToolCall {
+                    id: call.id,
+                    name: call.name,
+                    arguments,
+                    arguments_error,
+                }
             })
             .collect()
+    }
+}
+
+/// Parses a finished call's arguments text.
+///
+/// A finished call whose text is not a JSON object cannot be replayed as-is:
+/// the provider requires `arguments` to be JSON. It becomes `{}` and the text
+/// the model sent is kept beside it, so the tool result can quote it back
+/// instead of the model silently seeing an empty object.
+fn parse_arguments(text: Option<&str>) -> (Value, Option<String>) {
+    let Some(text) = text.filter(|text| !text.trim().is_empty()) else {
+        return (json!({}), None);
+    };
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Object(map)) => (Value::Object(map), None),
+        Ok(other) => (
+            json!({}),
+            Some(format!(
+                "tool arguments must be a JSON object, got {}\n\nReceived arguments:\n{text}",
+                match other {
+                    Value::Null => "null",
+                    Value::Bool(_) => "a boolean",
+                    Value::Number(_) => "a number",
+                    Value::String(_) => "a string",
+                    Value::Array(_) => "an array",
+                    Value::Object(_) => unreachable!(),
+                }
+            )),
+        ),
+        Err(err) => (
+            json!({}),
+            Some(format!("{err}\n\nReceived arguments:\n{text}")),
+        ),
     }
 }
 

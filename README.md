@@ -94,6 +94,29 @@ Conversation state lives in one `Vec<Item>`. Every user message, assistant
 reply, tool call, and tool result is appended to it, so each turn sees
 everything before it.
 
+That flat list is regrouped into the wire format on every request:
+
+| History | Wire message |
+| --- | --- |
+| `UserMessage` | one `user` message |
+| `AssistantMessage` followed by the `ToolCall`s of the same step | **one** `assistant` message carrying the text as `content` and every call in `tool_calls` |
+| `ToolResult` | one `tool` message with the matching `tool_call_id` |
+
+Providers reject a step split across several `assistant` messages, so the
+grouping is not cosmetic. An `assistant` message with neither text nor calls is
+skipped rather than sent empty, and a call that arrives with no text produces
+`content: null`.
+
+**History stays answerable.** A provider also rejects a call that is never
+answered, so every call the model declares gets exactly one result, in the
+order declared. Calls that never run are recorded as failed instead of being
+dropped: a cancelled turn answers the in-flight call and the rest of its batch,
+a reply cut off at the token limit answers each call it carried, and a call
+whose arguments did not parse answers with the parse error. A turn that ends
+early — cancelled, capped at 32 rounds, refused by the provider, or failed
+mid-way — adds one closing assistant message, so the next user prompt never
+follows a `tool` message.
+
 ## Streaming
 
 Each step is requested with `stream: true` and read as server-sent events. Prose
@@ -120,6 +143,21 @@ without configuration:
 In all four cases the reply is still correct and a gray `note:` line on stderr
 says the endpoint did not stream. Other failures, such as an invalid key or a
 rate limit, are reported as errors and are not retried.
+
+**Stalled connections.** A connection that cannot be opened fails after 10
+seconds, and one that goes silent fails after 120 seconds without a read. The
+read bound applies to each read rather than the whole reply, so a long stream
+that keeps arriving is never cut off, while a dead endpoint fails the turn
+instead of hanging it.
+
+**Stop reasons.** The provider's `finish_reason` is honoured. A reply cut off
+at the output token limit with tool calls in it has none of those calls run:
+their arguments may be truncated mid-value, so each is recorded as a failed
+result telling the model to re-issue it, and the turn ends with an error. A
+cut-off reply without tool calls is kept and a note says it was shortened. A
+`content_filter` finish is reported as an error naming it, rather than as the
+misleading "empty response". A provider that omits `finish_reason` altogether,
+as some proxies do, is accepted.
 
 ## Workspace layout
 
@@ -158,25 +196,65 @@ retries against a normalized copy, tolerating smart quotes, en-dashes, and
 trailing whitespace. Line endings and a byte-order mark are preserved on write.
 Overlapping or non-unique edits are rejected rather than guessed at.
 
+**Malformed tool arguments.** When the model finishes a call whose arguments
+text is not a JSON object, that call is not run: it would only fail against a
+schema it never composed. The result tells the model the arguments were
+invalid and repeats the text it sent, so it can re-issue the call. The request
+body still carries a valid `{}` for that call, because providers require
+`arguments` to be JSON.
+
 ## Safety
 
-Two layers, neither of which is a security boundary on its own:
+Nimiao runs a model's instructions on your machine, so it defends against the
+mistakes and injected commands it can see before running anything. None of
+these layers is a security boundary on its own: the real boundary is the
+workspace sandbox plus whatever OS-level isolation you put around it.
 
-**Sandbox.** Every model-supplied path is resolved against the workspace root
-and rejected if it escapes. The check canonicalizes the deepest existing
-ancestor, so `..` traversal and symlink escapes are caught, while paths that do
-not exist yet are still accepted for writes. Windows device paths (`\\.\`,
-`\\?\GLOBALROOT`, named pipes) are refused outright.
+**What is defended.**
 
-**Command screening.** `execpolicy` tokenizes a command, splits it on shell
-separators, unwraps launchers such as `sudo`, `env`, and `xargs`, recurses into
-nested `bash -c` payloads, and blocks a short list of catastrophic operations:
-recursive deletes aimed at system roots, disk formatting, `dd` to a raw device,
-and fork bombs. It is a best-effort static check; it cannot see what a script
-does after it starts.
+- *Paths.* Every model-supplied path is resolved against the workspace root and
+  rejected if it escapes. The check canonicalizes the deepest existing
+  ancestor, so `..` traversal and symlink escapes are caught, while paths that
+  do not exist yet are still accepted for writes. Windows device paths
+  (`\\.\`, `\\?\GLOBALROOT`, named pipes) are refused outright.
+- *Commands.* `execpolicy` tokenizes a command, splits it on shell separators,
+  unwraps launchers such as `sudo`, `env`, and `xargs`, recurses into nested
+  `bash -c` payloads, and blocks a short list of catastrophic operations:
+  recursive deletes aimed at system roots, disk formatting, `dd` to a raw
+  device, and fork bombs.
+- *One level of wrapper.* It looks through `$(...)`, backticks and `<( )`
+  substitutions; `find`'s `-delete` and `-exec` family; and backslashes inside
+  a program name (`r\m`). A pipe that feeds a shell or an interpreter with no
+  script of its own (`curl … | sh`) is refused, because the code it runs never
+  appears in the command line.
+- *Redirections.* A target that would write outside the workspace
+  (`> /etc/passwd`, `> ../../x`, `> ~/.bashrc`) is refused. `> /dev/null`,
+  `2>&1`, and paths inside the workspace are fine. The comparison is lexical:
+  a symlink inside the workspace that points outside it is not caught.
+- *The environment.* Shell commands run with stdin set to null, are killed as a
+  process tree on timeout, and do not inherit `OPENAI_API_KEY`,
+  `OPENAI_BASE_URL`, or `OPENAI_MODEL_NAME`. The command is model-authored, so
+  leaving the key in reach would turn one prompt injection into a leak. The
+  rest of the environment, including `PATH` and `HOME`, passes through.
 
-Shell commands run with stdin set to null and are killed as a process tree on
-timeout, so nothing is left holding the pipes.
+**What is not defended.** These are known and accepted, not oversights:
+
+- A command assembled at runtime from variables, or a program name that is
+  itself computed (`$X -rf /`), because the value is not known until the shell
+  expands it.
+- A script already on disk: `check_command` sees `./deploy.sh`, not its
+  contents, and cannot see what any command does after it starts.
+- An interpreter or downloader not on the screening list.
+- Nesting deeper than 8 levels, and shell aliases, functions, and `source`d
+  profiles.
+- Anything an `ssh`, `docker exec`, or similar remote session does on the far
+  side.
+- Symlinks inside the workspace that point outside it: tool paths are safe,
+  because the sandbox canonicalizes them, but the redirect check is lexical and
+  does not resolve them.
+- Resource exhaustion: a command that is not catastrophic but is merely slow,
+  hungry, or long-running is bounded only by the 600-second timeout, its output
+  cap, and the 32-round step limit.
 
 ## Development
 
@@ -197,7 +275,25 @@ Branches, commit format, and the release process are described in
 [CONTRIBUTING.md](CONTRIBUTING.md). In short: Git Flow, Conventional Commits,
 pull requests target `develop`.
 
+`References/` is ignored through `.gitignore` and holds third-party reference
+checkouts used while working on Nimiao. Nothing in it is tracked, built, or
+published.
+
 ## Releases
+
+**0.0.4.** No new user-facing features; this release makes the protocol and the
+command screening hold up. Each model step now goes on the wire as one
+`assistant` message, so strict providers no longer reject a reply that carries
+both text and tool calls. History stays answerable after a cancelled turn, a
+truncated reply, a provider refusal, or the 32-round cap: every declared call
+gets exactly one result. The provider's `finish_reason` is honoured, malformed
+tool arguments are reported back instead of silently becoming `{}`, and a
+stalled endpoint fails the turn instead of hanging it. `execpolicy` now looks
+through command substitution, backticks, `<( )`, backslash-split program names,
+`find -delete`/`-exec`, and a pipe into an interpreter, refuses a redirection
+that would write outside the workspace, and the `bash` tool no longer hands
+`OPENAI_API_KEY` to the shell. See [How it works](#how-it-works),
+[Streaming](#streaming), and [Safety](#safety).
 
 **0.0.3.** The interactive client is now a full-screen TUI built with ratatui:
 a live transcript, a multi-line composer, a prompt queue, cancellation,
@@ -216,7 +312,8 @@ sandbox, command screening, and the REPL.
 ### Platform notes
 
 CI runs the test suite on Linux and Windows. The Windows jobs matter: `sandbox`,
-`execpolicy`, and the `bash` tool all carry platform-specific code.
+`execpolicy`, and the `bash` tool all carry platform-specific code, and clippy
+runs on both so a Windows-only lint cannot slip through.
 
 On Windows, the `bash` tool looks for Git for Windows in the usual install
 locations and on `PATH`, skipping `%SystemRoot%\System32\bash.exe` because that

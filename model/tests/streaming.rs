@@ -5,7 +5,7 @@
 //! request and answers it.
 
 use model::openai::OpenAIModel;
-use model::{Model, ModelEvent, ModelResponse};
+use model::{Model, ModelEvent, ModelResponse, StopReason};
 use protocol::Item;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -58,7 +58,7 @@ async fn model_replying(replies: Vec<Reply>) -> (OpenAIModel, Arc<AtomicUsize>) 
     });
 
     (
-        OpenAIModel::new("test-key", &base_url, "test-model"),
+        OpenAIModel::new("test-key", &base_url, "test-model").unwrap(),
         served,
     )
 }
@@ -154,6 +154,164 @@ async fn stream_events(model: &OpenAIModel) -> (ModelResponse, Vec<ModelEvent>) 
         .await
         .unwrap();
     (response, events)
+}
+
+/// Sends one completion and returns the request body the client built.
+///
+/// The body is parsed rather than matched as text, so the assertions below see
+/// the message structure rather than how `serde_json` happened to space it.
+async fn sent_body(history: &[Item], tools: &[protocol::ToolDefinition]) -> serde_json::Value {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let (sent, received) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        write_response(&mut stream, Reply::sse("data: [DONE]\n\n")).await;
+        let _ = sent.send(request);
+    });
+
+    let model = OpenAIModel::new("test-key", &base_url, "test-model").unwrap();
+    model
+        .complete_stream(history, tools, &mut |_| {})
+        .await
+        .unwrap();
+
+    let request = received.await.unwrap();
+    let body = request
+        .split_once("\r\n\r\n")
+        .expect("the request must carry a body")
+        .1;
+    serde_json::from_str(body).expect("the request body must be JSON")
+}
+
+fn call(id: &str, name: &str, arguments: serde_json::Value) -> Item {
+    Item::ToolCall(protocol::ToolCall::new(id, name, arguments))
+}
+
+#[tokio::test]
+async fn sends_text_and_a_call_as_one_assistant_message() {
+    let history = vec![
+        Item::UserMessage("hi".to_string()),
+        Item::AssistantMessage("running it. ".to_string()),
+        call("call_1", "bash", serde_json::json!({"command": "ls"})),
+        Item::ToolResult {
+            tool_call_id: "call_1".to_string(),
+            content: "a.txt".to_string(),
+            is_error: false,
+        },
+    ];
+
+    let body = sent_body(&history, &[]).await;
+    let messages = body["messages"].as_array().unwrap();
+
+    assert_eq!(messages.len(), 3, "{messages:#?}");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["content"], "running it. ");
+    let calls = messages[1]["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["id"], "call_1");
+    assert_eq!(calls[0]["type"], "function");
+    assert_eq!(calls[0]["function"]["name"], "bash");
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[2]["tool_call_id"], "call_1");
+}
+
+#[tokio::test]
+async fn sends_parallel_calls_in_one_assistant_message() {
+    let history = vec![
+        Item::UserMessage("hi".to_string()),
+        call("call_a", "read_file", serde_json::json!({"path": "a"})),
+        call("call_b", "read_file", serde_json::json!({"path": "b"})),
+        Item::ToolResult {
+            tool_call_id: "call_a".to_string(),
+            content: "a".to_string(),
+            is_error: false,
+        },
+        Item::ToolResult {
+            tool_call_id: "call_b".to_string(),
+            content: "b".to_string(),
+            is_error: false,
+        },
+    ];
+
+    let body = sent_body(&history, &[]).await;
+    let messages = body["messages"].as_array().unwrap();
+
+    assert_eq!(messages.len(), 4, "{messages:#?}");
+    let assistants: Vec<_> = messages
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .collect();
+    assert_eq!(assistants.len(), 1, "{messages:#?}");
+    assert!(assistants[0]["content"].is_null(), "{messages:#?}");
+    let calls = assistants[0]["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["id"], "call_a");
+    assert_eq!(calls[1]["id"], "call_b");
+}
+
+#[tokio::test]
+async fn keeps_text_with_parallel_calls_in_the_same_message() {
+    let history = vec![
+        Item::UserMessage("hi".to_string()),
+        Item::AssistantMessage("looking. ".to_string()),
+        call("call_a", "bash", serde_json::json!({"command": "one"})),
+        call("call_b", "bash", serde_json::json!({"command": "two"})),
+    ];
+
+    let body = sent_body(&history, &[]).await;
+    let messages = body["messages"].as_array().unwrap();
+
+    assert_eq!(messages.len(), 2, "{messages:#?}");
+    assert_eq!(messages[1]["content"], "looking. ");
+    assert_eq!(messages[1]["tool_calls"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn keeps_an_empty_call_id_empty() {
+    let history = vec![
+        Item::UserMessage("hi".to_string()),
+        call("", "bash", serde_json::json!({"command": "ls"})),
+    ];
+
+    let body = sent_body(&history, &[]).await;
+    let messages = body["messages"].as_array().unwrap();
+
+    // Fabricating an id would break the `tool_call_id` that answers it.
+    assert_eq!(messages[1]["tool_calls"][0]["id"], "");
+}
+
+#[tokio::test]
+async fn drops_an_assistant_message_with_nothing_in_it() {
+    let history = vec![
+        Item::UserMessage("hi".to_string()),
+        Item::AssistantMessage("   ".to_string()),
+        Item::AssistantMessage("ok".to_string()),
+    ];
+
+    let body = sent_body(&history, &[]).await;
+    let messages = body["messages"].as_array().unwrap();
+
+    assert_eq!(messages.len(), 2, "{messages:#?}");
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["content"], "ok");
+    assert!(messages[1].get("tool_calls").is_none());
+}
+
+#[tokio::test]
+async fn sends_tools_beside_the_messages() {
+    let tools = vec![protocol::ToolDefinition {
+        name: "bash".to_string(),
+        description: "run a shell command".to_string(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
+
+    let body = sent_body(&[Item::UserMessage("hi".to_string())], &tools).await;
+
+    assert_eq!(body["tools"][0]["function"]["name"], "bash");
+    assert_eq!(body["messages"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -352,7 +510,7 @@ async fn asks_for_an_event_stream() {
         let _ = sent.send(request);
     });
 
-    let model = OpenAIModel::new("test-key", &base_url, "test-model");
+    let model = OpenAIModel::new("test-key", &base_url, "test-model").unwrap();
     model.complete_stream(&[], &[], &mut |_| {}).await.unwrap();
 
     let request = received.await.unwrap().to_ascii_lowercase();
@@ -408,7 +566,7 @@ async fn reads_a_chunked_stream_piece_by_piece() {
     })
     .await;
 
-    let model = OpenAIModel::new("test-key", &base_url, "test-model");
+    let model = OpenAIModel::new("test-key", &base_url, "test-model").unwrap();
     let (response, events) = stream_events(&model).await;
 
     assert_eq!(response.content.as_deref(), Some("abc"));
@@ -439,7 +597,7 @@ async fn returns_as_soon_as_done_arrives() {
     })
     .await;
 
-    let model = OpenAIModel::new("test-key", &base_url, "test-model");
+    let model = OpenAIModel::new("test-key", &base_url, "test-model").unwrap();
     let completed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         stream_events(&model).await
     })
@@ -620,8 +778,93 @@ async fn ignores_a_delta_without_choices() {
 }
 
 #[tokio::test]
+async fn reports_a_length_finish_reason_from_a_stream() {
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"cut\"}}]}\n\n\
+         data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, events) = stream_events(&model).await;
+
+    assert_eq!(response.stop_reason, Some(StopReason::Length));
+    assert_eq!(events, [ModelEvent::Text("cut".to_string())]);
+}
+
+#[tokio::test]
+async fn reports_a_content_filter_from_a_stream() {
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(response.stop_reason, Some(StopReason::ContentFilter));
+}
+
+#[tokio::test]
+async fn reports_a_tool_calls_finish_reason() {
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
+}
+
+#[tokio::test]
+async fn leaves_the_stop_reason_unset_when_the_provider_omits_it() {
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    // Proxies commonly omit it; that must stay valid rather than fail.
+    assert_eq!(response.stop_reason, None);
+}
+
+#[tokio::test]
+async fn reports_a_finish_reason_from_a_whole_completion() {
+    let (model, _) = model_replying(vec![Reply::json(
+        "{\"choices\":[{\"message\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(response.content.as_deref(), Some("partial"));
+    assert_eq!(response.stop_reason, Some(StopReason::Length));
+}
+
+#[tokio::test]
+async fn keeps_an_unknown_finish_reason_as_other() {
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"network_error\"}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(
+        response.stop_reason,
+        Some(StopReason::Other("network_error".to_string()))
+    );
+}
+
+#[tokio::test]
 async fn keeps_a_finished_tool_call_whose_arguments_are_not_json() {
-    // A malformed fragment must not lose the call; it becomes `{}` as before.
+    // The call is kept so the history stays answerable, but `{}` alone would
+    // hide what the model actually said. The text it sent is kept beside it.
     let (model, _) = model_replying(vec![Reply::sse(
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"not json\"}}]}}]}\n\n\
          data: [DONE]\n\n",
@@ -633,4 +876,106 @@ async fn keeps_a_finished_tool_call_whose_arguments_are_not_json() {
     assert_eq!(response.tool_calls.len(), 1);
     assert_eq!(response.tool_calls[0].name, "bash");
     assert_eq!(response.tool_calls[0].arguments, serde_json::json!({}));
+    let error = response.tool_calls[0]
+        .arguments_error
+        .as_deref()
+        .expect("the malformed text must be kept");
+    assert!(error.contains("Received arguments:\nnot json"), "{error}");
+}
+
+#[tokio::test]
+async fn keeps_a_finished_tool_call_whose_arguments_are_not_an_object() {
+    // Valid JSON that is not an object cannot be replayed either: providers
+    // require `arguments` to be a JSON object.
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"[1,2]\"}}]}}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(response.tool_calls[0].arguments, serde_json::json!({}));
+    let error = response.tool_calls[0].arguments_error.as_deref().unwrap();
+    assert!(error.contains("must be a JSON object"), "{error}");
+    assert!(error.contains("[1,2]"), "{error}");
+}
+
+#[tokio::test]
+async fn accepts_a_call_with_no_arguments_text() {
+    let (model, _) = model_replying(vec![Reply::sse(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n\n\
+         data: [DONE]\n\n",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(response.tool_calls[0].arguments, serde_json::json!({}));
+    assert!(response.tool_calls[0].arguments_error.is_none());
+}
+
+#[tokio::test]
+async fn keeps_malformed_arguments_from_a_whole_completion() {
+    let (model, _) = model_replying(vec![Reply::json(
+        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"tool_calls\":[\
+           {\"id\":\"call_1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{oops\"}}]}}]}",
+    )])
+    .await;
+
+    let (response, _) = stream_events(&model).await;
+
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].arguments, serde_json::json!({}));
+    assert!(response.tool_calls[0]
+        .arguments_error
+        .as_deref()
+        .unwrap()
+        .contains("{oops"));
+}
+
+#[tokio::test]
+async fn does_not_send_the_argument_error_on_the_wire() {
+    let mut malformed = protocol::ToolCall::new("call_1", "bash", serde_json::json!({}));
+    malformed.arguments_error = Some("received garbage".to_string());
+    let history = vec![
+        Item::UserMessage("hi".to_string()),
+        Item::ToolCall(malformed),
+    ];
+
+    let body = sent_body(&history, &[]).await;
+    let message = &body["messages"][1];
+
+    assert_eq!(message["tool_calls"][0]["function"]["arguments"], "{}");
+    assert!(message["tool_calls"][0].get("arguments_error").is_none());
+}
+
+#[tokio::test]
+async fn gives_up_on_a_stalled_endpoint() {
+    // The server accepts the request and then says nothing. Without a read
+    // timeout the turn would wait forever.
+    let base_url = serve(|mut stream| async move {
+        // Hold the response open without sending anything: the request was
+        // accepted, so only a read timeout can end the wait.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let _ = stream.shutdown().await;
+    })
+    .await;
+
+    let model = OpenAIModel::with_timeouts(
+        "test-key",
+        &base_url,
+        "test-model",
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(200),
+    )
+    .unwrap();
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        model.complete_stream(&[], &[], &mut |_| {}).await
+    })
+    .await
+    .expect("the read timeout should have fired")
+    .expect_err("a silent endpoint is an error, not an empty reply");
+    assert!(format!("{error:#}").contains("timed out"), "{error:#}");
 }

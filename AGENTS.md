@@ -92,8 +92,14 @@ Do not weaken these in passing:
 
 - Every model-supplied path goes through `Sandbox::validate_path`. Do not join
   against the workspace root by hand.
-- Every shell command goes through `execpolicy::check_command` before it
-  reaches a shell.
+- Every shell command goes through `execpolicy::check_command` — or
+  `check_command_in` with the workspace root, which also refuses a redirection
+  that would write outside it — before it reaches a shell.
+- Every `ToolCall` written to history is followed immediately by exactly one
+  `ToolResult`, in the order the calls were declared, and a turn that ends
+  early appends a closing assistant message. `engine/src/lib.rs` documents the
+  invariant; `engine/tests/agent.rs` checks it with
+  `assert_history_is_well_formed`.
 - Output limits live in `tools/src/truncate.rs` (2000 lines or 50 KB, whichever
   is hit first), the `bash` timeout bounds in `tools/src/bash.rs` (30 seconds
   by default, 600 at most), and the per-turn step cap in `engine/src/lib.rs`
@@ -102,9 +108,10 @@ Do not weaken these in passing:
 
 ## Files that are not part of the repository
 
-- Third-party reference checkouts are kept out of the repository. They are not
-  tracked and not workspace members. Do not edit them, stage them, or add them
-  to the workspace.
+- `References/` holds third-party reference checkouts used while working on
+  Nimiao. It is listed in `.gitignore`, so it is neither tracked nor a
+  workspace member. Do not edit it, stage it, add it to the workspace, or copy
+  it into a commit. Read it by absolute path.
 - `target/` is build output.
 - `Cargo.lock` is committed and updated by Cargo, never by hand.
 

@@ -1,3 +1,6 @@
 /target
 **/*.rs.bk
 .env
+
+# Third-party reference checkouts, kept out of the repository.
+/References/
