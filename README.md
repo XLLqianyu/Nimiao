@@ -144,6 +144,12 @@ In all four cases the reply is still correct and a gray `note:` line on stderr
 says the endpoint did not stream. Other failures, such as an invalid key or a
 rate limit, are reported as errors and are not retried.
 
+**Stalled connections.** A connection that cannot be opened fails after 10
+seconds, and one that goes silent fails after 120 seconds without a read. The
+read bound applies to each read rather than the whole reply, so a long stream
+that keeps arriving is never cut off, while a dead endpoint fails the turn
+instead of hanging it.
+
 **Stop reasons.** The provider's `finish_reason` is honoured. A reply cut off
 at the output token limit with tool calls in it has none of those calls run:
 their arguments may be truncated mid-value, so each is recorded as a failed

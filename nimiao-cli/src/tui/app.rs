@@ -803,7 +803,7 @@ mod tests {
     use tools::{ToolContext, ToolRegistry};
 
     fn test_app() -> TuiApp<OpenAIModel> {
-        let model = OpenAIModel::new("test", "local", "test-model");
+        let model = OpenAIModel::new("test", "local", "test-model").unwrap();
         let ctx = ToolContext::new(sandbox::Sandbox::current().unwrap());
         let agent = Agent::new(model, ToolRegistry::new(Vec::new()), ctx);
         TuiApp::new(agent, "test-model".to_string(), std::env::temp_dir())

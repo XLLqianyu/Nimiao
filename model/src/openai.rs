@@ -6,10 +6,25 @@ use protocol::{Item, ToolCall};
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 /// Upper bound on bytes held while checking whether a claimed stream is one.
 /// A whole JSON completion is well below this.
 const MAX_SNIFF_BYTES: usize = 8 * 1024 * 1024;
+
+/// How long establishing the connection may take.
+///
+/// A provider that never accepts the socket would otherwise hold the turn
+/// forever; a DNS or TLS handshake that takes longer than this is not going to
+/// finish.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a single read may take once the connection is open.
+///
+/// This is a per-read bound, not a total one: a stream that keeps producing
+/// frames can run as long as it needs, while a connection that goes silent
+/// fails instead of hanging the turn.
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct OpenAIModel {
     client: reqwest::Client,
@@ -79,13 +94,38 @@ fn flush_step(messages: &mut Vec<serde_json::Value>, open: &mut Option<Assistant
 }
 
 impl OpenAIModel {
-    pub fn new(api_key: &str, base_url: &str, model_name: &str) -> Self {
-        Self {
-            client: reqwest::Client::new(),
+    /// Builds a model for an OpenAI-compatible endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Fails only if the HTTP client cannot be built, which in practice means
+    /// the TLS backend failed to initialise.
+    pub fn new(api_key: &str, base_url: &str, model_name: &str) -> anyhow::Result<Self> {
+        Self::with_timeouts(api_key, base_url, model_name, CONNECT_TIMEOUT, READ_TIMEOUT)
+    }
+
+    /// Builds a model with explicit connection and read timeouts.
+    ///
+    /// Tests use this to prove a stalled endpoint fails quickly rather than
+    /// waiting out the production bounds.
+    pub fn with_timeouts(
+        api_key: &str,
+        base_url: &str,
+        model_name: &str,
+        connect: Duration,
+        read: Duration,
+    ) -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(connect)
+            .read_timeout(read)
+            .build()
+            .context("failed to build the HTTP client")?;
+        Ok(Self {
+            client,
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
             model_name: model_name.to_string(),
-        }
+        })
     }
 
     /// Maps the flat history onto the wire, one `assistant` message per step.
