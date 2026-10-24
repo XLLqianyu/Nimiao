@@ -281,7 +281,8 @@ sandbox, command screening, and the REPL.
 ### Platform notes
 
 CI runs the test suite on Linux and Windows. The Windows jobs matter: `sandbox`,
-`execpolicy`, and the `bash` tool all carry platform-specific code.
+`execpolicy`, and the `bash` tool all carry platform-specific code, and clippy
+runs on both so a Windows-only lint cannot slip through.
 
 On Windows, the `bash` tool looks for Git for Windows in the usual install
 locations and on `PATH`, skipping `%SystemRoot%\System32\bash.exe` because that
