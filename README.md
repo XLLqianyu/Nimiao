@@ -281,6 +281,20 @@ published.
 
 ## Releases
 
+**0.0.4.** No new user-facing features; this release makes the protocol and the
+command screening hold up. Each model step now goes on the wire as one
+`assistant` message, so strict providers no longer reject a reply that carries
+both text and tool calls. History stays answerable after a cancelled turn, a
+truncated reply, a provider refusal, or the 32-round cap: every declared call
+gets exactly one result. The provider's `finish_reason` is honoured, malformed
+tool arguments are reported back instead of silently becoming `{}`, and a
+stalled endpoint fails the turn instead of hanging it. `execpolicy` now looks
+through command substitution, backticks, `<( )`, backslash-split program names,
+`find -delete`/`-exec`, and a pipe into an interpreter, refuses a redirection
+that would write outside the workspace, and the `bash` tool no longer hands
+`OPENAI_API_KEY` to the shell. See [How it works](#how-it-works),
+[Streaming](#streaming), and [Safety](#safety).
+
 **0.0.3.** The interactive client is now a full-screen TUI built with ratatui:
 a live transcript, a multi-line composer, a prompt queue, cancellation,
 Markdown rendering, scrolling, and a detail page for full tool output.
