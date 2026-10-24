@@ -107,6 +107,16 @@ grouping is not cosmetic. An `assistant` message with neither text nor calls is
 skipped rather than sent empty, and a call that arrives with no text produces
 `content: null`.
 
+**History stays answerable.** A provider also rejects a call that is never
+answered, so every call the model declares gets exactly one result, in the
+order declared. Calls that never run are recorded as failed instead of being
+dropped: a cancelled turn answers the in-flight call and the rest of its batch,
+a reply cut off at the token limit answers each call it carried, and a call
+whose arguments did not parse answers with the parse error. A turn that ends
+early — cancelled, capped at 32 rounds, refused by the provider, or failed
+mid-way — adds one closing assistant message, so the next user prompt never
+follows a `tool` message.
+
 ## Streaming
 
 Each step is requested with `stream: true` and read as server-sent events. Prose
